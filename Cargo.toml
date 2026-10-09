@@ -1,0 +1,27 @@
+[package]
+name = "riff-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "A lightweight native Rust music client for YouTube"
+
+[dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "accesskit", "default_fonts", "x11", "wayland"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Pipes", "Win32_Foundation"] }
+
+[features]
+# Isolated fixtures and native screenshot capture for visual QA. Never enabled by default.
+ui-qa = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
