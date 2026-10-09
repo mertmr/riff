@@ -1,5 +1,5 @@
 //! Small local collections. A single writer serializes snapshots off the UI thread.
-use crate::model::{Track, is_valid_video_id};
+use crate::model::{Collection, Playlist, SavedAlbum, Track, is_valid_video_id};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,6 +19,10 @@ pub struct Session {
     pub recent: Vec<Track>,
     pub queue: Vec<Track>,
     pub volume: u8,
+    pub saved_tracks: Arc<Vec<Track>>,
+    pub albums: Arc<Vec<SavedAlbum>>,
+    pub artists: Arc<Vec<Collection>>,
+    pub playlists: Arc<Vec<Playlist>>,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -26,6 +30,10 @@ impl Default for Session {
             recent: Vec::new(),
             queue: Vec::new(),
             volume: 70,
+            saved_tracks: Default::default(),
+            albums: Default::default(),
+            artists: Default::default(),
+            playlists: Default::default(),
         }
     }
 }
@@ -61,6 +69,16 @@ pub fn load_library() -> (Vec<Track>, Session, Option<String>) {
     sanitize(&mut favorites);
     sanitize(&mut session.recent);
     sanitize(&mut session.queue);
+    sanitize(Arc::make_mut(&mut session.saved_tracks));
+    let mut ids = std::collections::HashSet::new();
+    Arc::make_mut(&mut session.playlists)
+        .retain(|p| p.id > 0 && !p.title.trim().is_empty() && ids.insert(p.id));
+    for playlist in Arc::make_mut(&mut session.playlists) {
+        sanitize(&mut playlist.tracks);
+    }
+    for album in Arc::make_mut(&mut session.albums) {
+        sanitize(&mut album.tracks);
+    }
     session.recent.truncate(40);
     session.volume = session.volume.min(100);
     (favorites, session, error)
@@ -216,6 +234,7 @@ mod tests {
             title: "Favorite".into(),
             artist: "Artist".into(),
             duration_seconds: Some(213),
+            ..Default::default()
         };
         let path = dir.join("favorites.json");
         save_to(&path, &vec![track.clone()]).unwrap();
@@ -228,6 +247,7 @@ mod tests {
             recent: vec![track.clone()],
             queue: vec![track],
             volume: 37,
+            ..Default::default()
         };
         save_to(&path, &session).unwrap();
         let loaded: Session = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -238,5 +258,50 @@ mod tests {
         assert_eq!(old.volume, 70);
         assert!(old.queue.is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn collections_round_trip_and_legacy_tracks_remain_readable() {
+        use crate::model::CollectionKind;
+        let track: Track = serde_json::from_str(
+            r#"{"id":"dQw4w9WgXcQ","title":"Song","artist":"Artist","duration_seconds":213}"#,
+        )
+        .unwrap();
+        assert!(track.album_id.is_none());
+        let collection = Collection {
+            id: "MPREalbum".into(),
+            title: "Album".into(),
+            subtitle: "Artist".into(),
+            kind: CollectionKind::Album,
+            thumbnail: None,
+            params: None,
+        };
+        let session = Session {
+            saved_tracks: vec![track.clone()].into(),
+            albums: vec![SavedAlbum {
+                collection: collection.clone(),
+                tracks: vec![track.clone()],
+            }]
+            .into(),
+            artists: vec![Collection {
+                kind: CollectionKind::Artist,
+                ..collection
+            }]
+            .into(),
+            playlists: vec![Playlist {
+                id: 42,
+                title: "Mix".into(),
+                tracks: vec![track.clone(), track.clone()],
+            }]
+            .into(),
+            ..Default::default()
+        };
+        let loaded: Session =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert_eq!(loaded.playlists[0].id, 42);
+        assert_eq!(loaded.playlists[0].tracks, [track.clone(), track.clone()]);
+        assert_eq!(loaded.albums[0].tracks, [track]);
+        assert_eq!(loaded.artists.len(), 1);
+        let old: Session = serde_json::from_str(r#"{"queue":[],"volume":50}"#).unwrap();
+        assert!(old.playlists.is_empty() && old.albums.is_empty() && old.saved_tracks.is_empty());
     }
 }

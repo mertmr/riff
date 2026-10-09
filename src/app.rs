@@ -1,6 +1,7 @@
 //! Application state and effects. Rendering emits actions; workers never touch UI state.
 use crate::{
-    model::Track,
+    catalog::{self, Page, SearchFilter},
+    model::{Collection, CollectionKind, Playlist, SavedAlbum, Track, move_item},
     player::{self, PlaybackEvent, PlayerCommand, PlayerEvent},
     radio::Radio,
     search,
@@ -9,6 +10,7 @@ use crate::{
 };
 use eframe::egui;
 use std::{
+    cell::RefCell,
     collections::{HashSet, VecDeque},
     sync::{
         Arc,
@@ -25,6 +27,10 @@ pub enum View {
     Search,
     Library,
     Favorites,
+    Albums,
+    Artists,
+    Playlists,
+    Collection,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Playback {
@@ -38,6 +44,7 @@ pub enum Playback {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LibraryTab {
     All,
+    Saved,
     Favorites,
     Recent,
 }
@@ -72,6 +79,26 @@ pub enum Action {
     PlayFavorites,
     RefreshLibrary,
     LibraryTab(LibraryTab),
+    SearchFilter(SearchFilter),
+    SearchMore,
+    OpenCollection(Collection),
+    CollectionMore,
+    RetryCollection,
+    Back,
+    SaveCollection,
+    SaveTrack(Track),
+    AddToPlaylist(Track),
+    OpenPlaylist(u64),
+    CreatePlaylist(String, Vec<Track>),
+    RenamePlaylist(u64, String),
+    DeletePlaylist(u64),
+    PlaylistAdd(u64, Track, usize),
+    PlaylistRemove(u64, usize),
+    PlaylistMove(u64, usize, usize),
+    PlaylistDrop(u64, TrackDrag, usize),
+    PlayTracks(Vec<Track>),
+    QueueTracks(Vec<Track>),
+    QueueDrop(TrackDrag, usize),
     DismissError,
     DismissNotice,
 }
@@ -83,6 +110,62 @@ struct SearchJob {
     token: u64,
     query: String,
     ctx: egui::Context,
+}
+
+enum CatalogRequest {
+    Search(String, SearchFilter, Option<String>),
+    Browse(Collection, Option<String>),
+}
+struct CatalogJob {
+    token: u64,
+    request: CatalogRequest,
+    ctx: egui::Context,
+}
+struct CatalogResult {
+    token: u64,
+    detail: bool,
+    append: bool,
+    result: Result<Page, String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum DragOrigin {
+    Track,
+    Queue {
+        index: usize,
+        revision: u64,
+    },
+    Playlist {
+        id: u64,
+        index: usize,
+        revision: u64,
+    },
+}
+#[derive(Clone, Debug)]
+pub struct TrackDrag {
+    pub track: Track,
+    pub origin: DragOrigin,
+}
+
+pub enum PlaylistEditor {
+    Create { title: String, tracks: Vec<Track> },
+    Rename { id: u64, title: String },
+    Delete { id: u64, title: String },
+    Add(Track),
+}
+struct BackState {
+    view: View,
+    collection: Option<Collection>,
+    page: Page,
+    playlist: Option<u64>,
+}
+
+#[derive(Clone)]
+struct CollectionSnapshot {
+    tracks: Arc<Vec<Track>>,
+    albums: Arc<Vec<SavedAlbum>>,
+    artists: Arc<Vec<Collection>>,
+    playlists: Arc<Vec<Playlist>>,
 }
 pub struct Notice {
     pub text: String,
@@ -128,6 +211,23 @@ pub struct MusicApp {
     pub favorites: Vec<Track>,
     pub recent: Vec<Track>,
     pub library: Vec<Track>,
+    pub saved_tracks: Vec<Track>,
+    pub albums: Vec<SavedAlbum>,
+    pub artists: Vec<Collection>,
+    pub playlists: Vec<Playlist>,
+    pub playlist_editor: Option<PlaylistEditor>,
+    pub playlist_id: Option<u64>,
+    pub collection: Option<Collection>,
+    pub detail: Page,
+    pub detail_loading: bool,
+    pub detail_error: Option<String>,
+    back_stack: Vec<BackState>,
+    pub search_filter: SearchFilter,
+    pub search_collections: Vec<Collection>,
+    pub search_continuation: Option<String>,
+    pub queue_revision: u64,
+    pub playlist_revision: u64,
+    collection_snapshot: RefCell<Option<CollectionSnapshot>>,
     pub filter: String,
     pub library_tab: LibraryTab,
     pub queue: VecDeque<Track>,
@@ -158,8 +258,8 @@ pub struct MusicApp {
     pub artwork: ui::widgets::Artwork,
     search_token: u64,
     search_epoch: Arc<AtomicU64>,
-    search_tx: Sender<SearchJob>,
-    search_rx: Receiver<SearchResult>,
+    search_tx: Sender<CatalogJob>,
+    search_rx: Receiver<CatalogResult>,
     radio_token: u64,
     radio_epoch: Arc<AtomicU64>,
     radio_tx: Sender<SearchJob>,
@@ -184,20 +284,46 @@ impl MusicApp {
     fn from_context(ctx: &egui::Context) -> Self {
         ui::theme::install(ctx);
         let (favorites, session, global_error) = storage::load_library();
-        let (search_tx, jobs) = mpsc::channel::<SearchJob>();
+        let (search_tx, jobs) = mpsc::channel::<CatalogJob>();
         let (result_tx, search_rx) = mpsc::channel();
         let search_epoch = Arc::new(AtomicU64::new(0));
         let cancellation = search_epoch.clone();
         thread::spawn(move || {
+            let client = catalog::Client::new();
             while let Ok(mut job) = jobs.recv() {
                 while let Ok(newer) = jobs.try_recv() {
                     job = newer;
                 }
-                let result = search::search_youtube(&job.query, || {
-                    cancellation.load(Ordering::Relaxed) != job.token
-                });
-                let _ = result_tx.send(SearchResult {
+                if cancellation.load(Ordering::Relaxed) != job.token {
+                    continue;
+                }
+                let (detail, append, result) = match &job.request {
+                    CatalogRequest::Search(query, filter, continuation) => {
+                        let result = client.search(query, *filter, continuation.as_deref());
+                        // Keep song search available if the music catalog is temporarily unavailable.
+                        let result = if result.is_err()
+                            && continuation.is_none()
+                            && matches!(filter, SearchFilter::All | SearchFilter::Songs)
+                        {
+                            search::search_youtube(query, || {
+                                cancellation.load(Ordering::Relaxed) != job.token
+                            })
+                            .map(Page::from)
+                        } else {
+                            result
+                        };
+                        (false, continuation.is_some(), result)
+                    }
+                    CatalogRequest::Browse(collection, continuation) => (
+                        true,
+                        continuation.is_some(),
+                        client.browse(collection, continuation.as_deref()),
+                    ),
+                };
+                let _ = result_tx.send(CatalogResult {
                     token: job.token,
+                    detail,
+                    append,
                     result,
                 });
                 job.ctx.request_repaint();
@@ -251,6 +377,23 @@ impl MusicApp {
             favorites,
             recent: session.recent,
             library: Vec::new(),
+            saved_tracks: Arc::unwrap_or_clone(session.saved_tracks),
+            albums: Arc::unwrap_or_clone(session.albums),
+            artists: Arc::unwrap_or_clone(session.artists),
+            playlists: Arc::unwrap_or_clone(session.playlists),
+            collection_snapshot: RefCell::new(None),
+            playlist_editor: None,
+            playlist_id: None,
+            collection: None,
+            detail: Page::default(),
+            detail_loading: false,
+            detail_error: None,
+            back_stack: Vec::new(),
+            search_filter: SearchFilter::All,
+            search_collections: Vec::new(),
+            search_continuation: None,
+            queue_revision: 0,
+            playlist_revision: 0,
             filter: String::new(),
             library_tab: LibraryTab::All,
             queue: session.queue.into(),
@@ -313,20 +456,43 @@ impl MusicApp {
         match self.view {
             View::Search => &self.results,
             View::Favorites | View::Library => &self.library,
+            View::Collection => self
+                .playlist_id
+                .and_then(|id| self.playlists.iter().find(|p| p.id == id))
+                .map_or(&self.detail.tracks, |p| &p.tracks),
+            View::Albums | View::Artists | View::Playlists => &[],
             View::Home if !self.recommendations.tracks.is_empty() => &self.recommendations.tracks,
             View::Home => &self.recent[..self.recent.len().min(12)],
         }
+    }
+    fn collection_snapshot(&self) -> CollectionSnapshot {
+        // Volume and queue changes reuse immutable collection snapshots.
+        // Large playlists are copied only when the collections themselves change.
+        let mut cached = self.collection_snapshot.borrow_mut();
+        cached
+            .get_or_insert_with(|| CollectionSnapshot {
+                tracks: Arc::new(self.saved_tracks.clone()),
+                albums: Arc::new(self.albums.clone()),
+                artists: Arc::new(self.artists.clone()),
+                playlists: Arc::new(self.playlists.clone()),
+            })
+            .clone()
     }
     fn persist(&self) {
         if !self.write_library {
             return;
         }
+        let snapshot = self.collection_snapshot();
         self.writer.save(
             &self.favorites,
             Session {
                 recent: self.recent.clone(),
                 queue: self.queue.iter().cloned().collect(),
                 volume: self.volume,
+                saved_tracks: snapshot.tracks.clone(),
+                albums: snapshot.albums.clone(),
+                artists: snapshot.artists.clone(),
+                playlists: snapshot.playlists.clone(),
             },
         );
     }
@@ -344,8 +510,30 @@ impl MusicApp {
             self.library.extend(self.favorites.iter().cloned());
         }
         if !favorites_only {
-            for track in &self.recent {
-                if !self.library.iter().any(|t| t.id == track.id) {
+            let mut ids: HashSet<String> = self.library.iter().map(|t| t.id.clone()).collect();
+            let tracks = self
+                .recent
+                .iter()
+                .filter(|_| self.library_tab != LibraryTab::Saved)
+                .chain(
+                    self.saved_tracks
+                        .iter()
+                        .filter(|_| self.library_tab != LibraryTab::Recent),
+                )
+                .chain(
+                    self.albums
+                        .iter()
+                        .filter(|_| self.library_tab != LibraryTab::Recent)
+                        .flat_map(|a| &a.tracks),
+                )
+                .chain(
+                    self.playlists
+                        .iter()
+                        .filter(|_| self.library_tab != LibraryTab::Recent)
+                        .flat_map(|p| &p.tracks),
+                );
+            for track in tracks {
+                if ids.insert(track.id.clone()) {
                     self.library.push(track.clone());
                 }
             }
@@ -358,6 +546,133 @@ impl MusicApp {
             });
         }
         self.selected = None;
+    }
+    fn request_catalog(&mut self, request: CatalogRequest, ctx: &egui::Context) {
+        let detail = matches!(request, CatalogRequest::Browse(..));
+        self.search_token = self.search_token.wrapping_add(1);
+        self.search_epoch
+            .store(self.search_token, Ordering::Relaxed);
+        self.searching = !detail;
+        self.detail_loading = detail;
+        if detail {
+            self.detail_error = None;
+        } else {
+            self.search_error = None;
+            self.search_done = false;
+        }
+        if self
+            .search_tx
+            .send(CatalogJob {
+                token: self.search_token,
+                request,
+                ctx: ctx.clone(),
+            })
+            .is_err()
+        {
+            self.searching = false;
+            self.detail_loading = false;
+            self.global_error =
+                Some("The catalog worker stopped. Restart Riff to reconnect.".into());
+        }
+    }
+    fn cancel_catalog(&mut self) {
+        self.search_token = self.search_token.wrapping_add(1);
+        self.search_epoch
+            .store(self.search_token, Ordering::Relaxed);
+        self.searching = false;
+        self.detail_loading = false;
+    }
+    fn push_back_state(&mut self) {
+        self.back_stack.push(BackState {
+            view: self.view,
+            collection: self.collection.clone(),
+            page: std::mem::take(&mut self.detail),
+            playlist: self.playlist_id,
+        });
+        if self.back_stack.len() > 16 {
+            self.back_stack.remove(0);
+        }
+    }
+    pub fn collection_saved(&self, collection: &Collection) -> bool {
+        match collection.kind {
+            CollectionKind::Album => self.albums.iter().any(|a| a.collection.id == collection.id),
+            CollectionKind::Artist => self.artists.iter().any(|a| a.id == collection.id),
+            CollectionKind::Playlist | CollectionKind::Discography => false,
+        }
+    }
+    fn create_playlist(&mut self, title: String, tracks: Vec<Track>) {
+        let title = title.trim();
+        if title.is_empty() {
+            return;
+        }
+        let Some(id) = self
+            .playlists
+            .iter()
+            .map(|p| p.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+        else {
+            return;
+        };
+        self.playlists.push(Playlist {
+            id,
+            title: title.chars().take(200).collect(),
+            tracks,
+        });
+        self.collection_snapshot.get_mut().take();
+        self.playlist_revision = self.playlist_revision.wrapping_add(1);
+        self.rebuild_library();
+        self.persist();
+        self.notify("Playlist created");
+    }
+    fn queue_drop(&mut self, drag: TrackDrag, slot: usize) {
+        if slot > self.queue_len() {
+            return;
+        }
+        let target = match drag.origin {
+            DragOrigin::Queue { index, revision } => {
+                if revision != self.queue_revision || self.queue_track(index) != Some(&drag.track) {
+                    return;
+                }
+                let target = slot.saturating_sub(usize::from(index < slot));
+                if index == target {
+                    return;
+                }
+                let manual = self.queue.len();
+                if index < manual && target < manual {
+                    move_item(&mut self.queue, index, slot);
+                } else if index >= manual && target >= manual {
+                    if let Some(radio) = &mut self.radio {
+                        move_item(&mut radio.upcoming, index - manual, slot - manual);
+                    }
+                } else {
+                    // Crossing the priority boundary makes the resulting order explicit.
+                    if let Some(radio) = &mut self.radio {
+                        self.queue.append(&mut radio.upcoming);
+                    }
+                    move_item(&mut self.queue, index, slot);
+                }
+                target
+            }
+            _ => {
+                // Preserve exactly the visible insertion position, including radio suggestions.
+                if let Some(radio) = &mut self.radio {
+                    while self.queue.len() < slot {
+                        let Some(track) = radio.upcoming.pop_front() else {
+                            break;
+                        };
+                        self.queue.push_back(track);
+                    }
+                    radio.remember(&drag.track.id);
+                }
+                self.queue.insert(slot, drag.track);
+                slot
+            }
+        };
+        self.queue_revision = self.queue_revision.wrapping_add(1);
+        self.queue_selected = Some(target);
+        self.persist();
     }
     fn play(&mut self, track: Track, add_history: bool) {
         if let Some(radio) = &mut self.radio {
@@ -396,6 +711,7 @@ impl MusicApp {
         }
     }
     fn next(&mut self) {
+        self.queue_revision = self.queue_revision.wrapping_add(1);
         let track = self.queue.pop_front().or_else(|| {
             let radio = self.radio.as_mut()?;
             let track = radio.upcoming.pop_front()?;
@@ -508,9 +824,7 @@ impl MusicApp {
         let Some(target) = index.checked_add_signed(delta) else {
             return false;
         };
-        index < self.queue_len()
-            && target < self.queue_len()
-            && (index < self.queue.len()) == (target < self.queue.len())
+        index < self.queue_len() && target < self.queue_len()
     }
     fn receive(&mut self) {
         while let Ok(message) = self.recommendation_rx.try_recv() {
@@ -529,6 +843,7 @@ impl MusicApp {
             self.selected = None;
         }
         while let Ok(message) = self.radio_rx.try_recv() {
+            self.queue_revision = self.queue_revision.wrapping_add(1);
             if message.token != self.radio_token {
                 continue;
             }
@@ -557,16 +872,43 @@ impl MusicApp {
             if message.token != self.search_token {
                 continue;
             }
-            self.searching = false;
-            self.search_done = true;
-            match message.result {
-                Ok(tracks) => {
-                    self.results = tracks;
-                    self.selected = None;
+            if message.detail {
+                self.detail_loading = false;
+                match message.result {
+                    Ok(page) => {
+                        if message.append {
+                            self.detail.append_collection(page);
+                        } else {
+                            self.detail = page;
+                        }
+                        self.detail_error = None;
+                    }
+                    Err(error) => self.detail_error = Some(error),
                 }
-                Err(e) => {
-                    self.search_error = Some(e);
-                    self.results.clear();
+            } else {
+                self.searching = false;
+                self.search_done = true;
+                match message.result {
+                    Ok(page) => {
+                        if message.append {
+                            let mut current = Page {
+                                tracks: std::mem::take(&mut self.results),
+                                collections: std::mem::take(&mut self.search_collections),
+                                continuation: None,
+                            };
+                            current.append(page);
+                            self.results = current.tracks;
+                            self.search_collections = current.collections;
+                            self.search_continuation = current.continuation;
+                        } else {
+                            self.results = page.tracks;
+                            self.search_collections = page.collections;
+                            self.search_continuation = page.continuation;
+                            self.selected = None;
+                        }
+                        self.search_error = None;
+                    }
+                    Err(error) => self.search_error = Some(error),
                 }
             }
         }
@@ -625,8 +967,39 @@ impl MusicApp {
         }
     }
     pub fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
+        if matches!(
+            &action,
+            Action::SaveTrack(..)
+                | Action::SaveCollection
+                | Action::RenamePlaylist(..)
+                | Action::DeletePlaylist(..)
+                | Action::PlaylistAdd(..)
+                | Action::PlaylistRemove(..)
+                | Action::PlaylistMove(..)
+        ) {
+            self.collection_snapshot.get_mut().take();
+        }
+        if matches!(
+            &action,
+            Action::Enqueue(..)
+                | Action::QueuePlay(..)
+                | Action::QueueRemove(..)
+                | Action::QueueMove(..)
+                | Action::ClearQueue
+                | Action::PlayFavorites
+                | Action::Previous
+                | Action::StartRadio(..)
+                | Action::StopRadio
+        ) {
+            self.queue_revision = self.queue_revision.wrapping_add(1);
+        }
         match action {
             Action::Navigate(view) => {
+                self.cancel_catalog();
+                self.back_stack.clear();
+                self.collection = None;
+                self.playlist_id = None;
+                self.detail = Page::default();
                 self.view = view;
                 self.selected = None;
                 self.filter.clear();
@@ -640,6 +1013,7 @@ impl MusicApp {
                 }
             }
             Action::FocusSearch => {
+                self.cancel_catalog();
                 self.view = View::Search;
                 self.focus_search = true;
                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("global_search")));
@@ -651,27 +1025,14 @@ impl MusicApp {
                 }
                 self.submitted_query = self.query.trim().to_owned();
                 self.view = View::Search;
-                self.search_token = self.search_token.wrapping_add(1);
-                self.search_epoch
-                    .store(self.search_token, Ordering::Relaxed);
-                self.searching = true;
-                self.search_error = None;
+                self.search_collections.clear();
+                self.search_continuation = None;
                 self.results.clear();
-                self.search_done = false;
                 self.selected = None;
-                if self
-                    .search_tx
-                    .send(SearchJob {
-                        token: self.search_token,
-                        query: self.submitted_query.clone(),
-                        ctx: ctx.clone(),
-                    })
-                    .is_err()
-                {
-                    self.searching = false;
-                    self.search_error =
-                        Some("The search worker stopped. Restart Riff to reconnect.".into());
-                }
+                self.request_catalog(
+                    CatalogRequest::Search(self.submitted_query.clone(), self.search_filter, None),
+                    ctx,
+                );
             }
             Action::CancelSearch => {
                 self.search_token = self.search_token.wrapping_add(1);
@@ -795,15 +1156,16 @@ impl MusicApp {
             Action::QueueMove(i, delta) => {
                 if self.can_queue_move(i, delta) {
                     let target = i.checked_add_signed(delta).unwrap();
-                    if i < self.queue.len() {
-                        self.queue.swap(i, target);
-                    } else if let Some(radio) = &mut self.radio {
-                        radio
-                            .upcoming
-                            .swap(i - self.queue.len(), target - self.queue.len());
-                    }
-                    self.queue_selected = Some(target);
-                    self.persist();
+                    self.queue_drop(
+                        TrackDrag {
+                            track: self.queue_track(i).unwrap().clone(),
+                            origin: DragOrigin::Queue {
+                                index: i,
+                                revision: self.queue_revision,
+                            },
+                        },
+                        target + usize::from(i < target),
+                    );
                 }
             }
             Action::QueueSelect(i) => {
@@ -848,6 +1210,228 @@ impl MusicApp {
                 }
             }
             Action::RefreshLibrary => self.rebuild_library(),
+            Action::SearchFilter(filter) => {
+                self.search_filter = filter;
+                if !self.query.trim().is_empty() {
+                    self.dispatch(Action::Search, ctx);
+                }
+            }
+            Action::SearchMore => {
+                if !self.searching
+                    && let Some(token) = self.search_continuation.clone()
+                {
+                    self.request_catalog(
+                        CatalogRequest::Search(
+                            self.submitted_query.clone(),
+                            self.search_filter,
+                            Some(token),
+                        ),
+                        ctx,
+                    );
+                }
+            }
+            Action::OpenCollection(collection) => {
+                self.cancel_catalog();
+                self.push_back_state();
+                self.view = View::Collection;
+                self.playlist_id = None;
+                self.selected = None;
+                self.filter.clear();
+                self.collection = Some(collection.clone());
+                if let Some(album) = self
+                    .albums
+                    .iter()
+                    .find(|a| a.collection.id == collection.id)
+                {
+                    self.detail.tracks = album.tracks.clone();
+                }
+                self.request_catalog(CatalogRequest::Browse(collection, None), ctx);
+            }
+            Action::CollectionMore => {
+                if !self.detail_loading
+                    && let (Some(collection), Some(token)) =
+                        (self.collection.clone(), self.detail.continuation.clone())
+                {
+                    self.request_catalog(CatalogRequest::Browse(collection, Some(token)), ctx);
+                }
+            }
+            Action::RetryCollection => {
+                if let Some(collection) = self.collection.clone() {
+                    let token =
+                        if self.detail.tracks.is_empty() && self.detail.collections.is_empty() {
+                            None
+                        } else {
+                            self.detail.continuation.clone()
+                        };
+                    self.request_catalog(CatalogRequest::Browse(collection, token), ctx);
+                }
+            }
+            Action::Back => {
+                self.cancel_catalog();
+                if let Some(state) = self.back_stack.pop() {
+                    self.view = state.view;
+                    self.collection = state.collection;
+                    self.detail = state.page;
+                    self.playlist_id = state.playlist;
+                    self.detail_error = None;
+                    self.selected = None;
+                    self.filter.clear();
+                } else {
+                    self.dispatch(Action::Navigate(View::Library), ctx);
+                }
+            }
+            Action::SaveTrack(track) => {
+                if self.saved_tracks.iter().any(|t| t.id == track.id) {
+                    self.saved_tracks.retain(|t| t.id != track.id);
+                    self.notify("Removed from saved songs");
+                } else {
+                    self.saved_tracks.push(track);
+                    self.notify("Saved to library");
+                }
+                self.rebuild_library();
+                self.persist();
+            }
+            Action::AddToPlaylist(track) => self.playlist_editor = Some(PlaylistEditor::Add(track)),
+            Action::SaveCollection => {
+                if let Some(collection) = self.collection.clone() {
+                    match collection.kind {
+                        CollectionKind::Album => {
+                            if self.collection_saved(&collection) {
+                                self.albums.retain(|a| a.collection.id != collection.id);
+                            } else if !self.detail_loading
+                                && self.detail_error.is_none()
+                                && self.detail.continuation.is_none()
+                            {
+                                self.albums.push(SavedAlbum {
+                                    collection,
+                                    tracks: self.detail.tracks.clone(),
+                                });
+                            }
+                        }
+                        CollectionKind::Artist => {
+                            if self.collection_saved(&collection) {
+                                self.artists.retain(|a| a.id != collection.id);
+                            } else {
+                                self.artists.push(collection);
+                            }
+                        }
+                        CollectionKind::Playlist => {
+                            if !self.detail_loading
+                                && self.detail_error.is_none()
+                                && self.detail.continuation.is_none()
+                            {
+                                self.create_playlist(collection.title, self.detail.tracks.clone());
+                            }
+                        }
+                        CollectionKind::Discography => {}
+                    }
+                    self.rebuild_library();
+                    self.persist();
+                }
+            }
+            Action::OpenPlaylist(id) => {
+                if self.playlists.iter().any(|p| p.id == id) {
+                    self.cancel_catalog();
+                    self.push_back_state();
+                    self.view = View::Collection;
+                    self.playlist_id = Some(id);
+                    self.collection = None;
+                    self.selected = None;
+                    self.filter.clear();
+                }
+            }
+            Action::CreatePlaylist(title, tracks) => self.create_playlist(title, tracks),
+            Action::RenamePlaylist(id, title) => {
+                if !title.trim().is_empty()
+                    && let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id)
+                {
+                    playlist.title = title.trim().chars().take(200).collect();
+                    self.persist();
+                }
+            }
+            Action::DeletePlaylist(id) => {
+                self.playlists.retain(|p| p.id != id);
+                self.playlist_revision = self.playlist_revision.wrapping_add(1);
+                if self.playlist_id == Some(id) {
+                    self.dispatch(Action::Navigate(View::Playlists), ctx);
+                }
+                self.rebuild_library();
+                self.persist();
+            }
+            Action::PlaylistAdd(id, track, slot) => {
+                if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id) {
+                    playlist
+                        .tracks
+                        .insert(slot.min(playlist.tracks.len()), track);
+                    self.playlist_revision = self.playlist_revision.wrapping_add(1);
+                    self.rebuild_library();
+                    self.persist();
+                    self.notify("Added to playlist");
+                }
+            }
+            Action::PlaylistRemove(id, index) => {
+                if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id)
+                    && index < playlist.tracks.len()
+                {
+                    playlist.tracks.remove(index);
+                    self.playlist_revision = self.playlist_revision.wrapping_add(1);
+                    self.rebuild_library();
+                    self.persist();
+                }
+            }
+            Action::PlaylistMove(id, from, slot) => {
+                if let Some(playlist) = self.playlists.iter_mut().find(|p| p.id == id)
+                    && from < playlist.tracks.len()
+                    && slot <= playlist.tracks.len()
+                {
+                    let to = slot.saturating_sub(usize::from(from < slot));
+                    if to > from {
+                        playlist.tracks[from..=to].rotate_left(1);
+                    } else if to < from {
+                        playlist.tracks[to..=from].rotate_right(1);
+                    }
+                    self.playlist_revision = self.playlist_revision.wrapping_add(1);
+                    self.persist();
+                }
+            }
+            Action::PlaylistDrop(id, drag, slot) => {
+                if let DragOrigin::Playlist {
+                    id: source,
+                    index,
+                    revision,
+                } = drag.origin
+                    && source == id
+                {
+                    if revision == self.playlist_revision
+                        && self
+                            .playlists
+                            .iter()
+                            .find(|p| p.id == id)
+                            .and_then(|p| p.tracks.get(index))
+                            == Some(&drag.track)
+                    {
+                        self.dispatch(Action::PlaylistMove(id, index, slot), ctx);
+                    }
+                } else {
+                    self.dispatch(Action::PlaylistAdd(id, drag.track, slot), ctx);
+                }
+            }
+            Action::PlayTracks(tracks) => {
+                if let Some(first) = tracks.first().cloned() {
+                    self.stop_radio();
+                    self.queue = tracks.into_iter().skip(1).collect();
+                    self.queue_revision = self.queue_revision.wrapping_add(1);
+                    self.play(first, true);
+                    self.persist();
+                }
+            }
+            Action::QueueTracks(tracks) => {
+                self.queue.extend(tracks);
+                self.queue_revision = self.queue_revision.wrapping_add(1);
+                self.persist();
+                self.notify("Added collection to queue");
+            }
+            Action::QueueDrop(drag, slot) => self.queue_drop(drag, slot),
             Action::LibraryTab(tab) => {
                 self.library_tab = tab;
                 self.rebuild_library();
@@ -857,6 +1441,9 @@ impl MusicApp {
         }
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.playlist_editor.is_some() {
+            return;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
             self.dispatch(Action::FocusSearch, ctx);
         }
@@ -909,11 +1496,42 @@ impl MusicApp {
         let count = self.active_tracks().len();
         if count > 0 {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-                self.selected = Some(self.selected.map_or(0, |i| (i + 1).min(count - 1)));
+                let start = self.selected.map_or(0, |i| (i + 1).min(count - 1));
+                let needle = self.filter.trim().to_lowercase();
+                self.selected = (start..count)
+                    .find(|i| {
+                        self.view != View::Collection
+                            || needle.is_empty()
+                            || self.active_tracks()[*i]
+                                .title
+                                .to_lowercase()
+                                .contains(&needle)
+                            || self.active_tracks()[*i]
+                                .artist
+                                .to_lowercase()
+                                .contains(&needle)
+                    })
+                    .or(self.selected);
                 self.reveal_selection = true;
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-                self.selected = Some(self.selected.unwrap_or(0).saturating_sub(1));
+                let start = self.selected.unwrap_or(0).saturating_sub(1);
+                let needle = self.filter.trim().to_lowercase();
+                self.selected = (0..=start)
+                    .rev()
+                    .find(|i| {
+                        self.view != View::Collection
+                            || needle.is_empty()
+                            || self.active_tracks()[*i]
+                                .title
+                                .to_lowercase()
+                                .contains(&needle)
+                            || self.active_tracks()[*i]
+                                .artist
+                                .to_lowercase()
+                                .contains(&needle)
+                    })
+                    .or(self.selected);
                 self.reveal_selection = true;
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
@@ -988,6 +1606,7 @@ mod tests {
             title: id.into(),
             artist: "Artist".into(),
             duration_seconds: Some(180),
+            ..Default::default()
         }
     }
     fn fixture() -> (
@@ -1001,12 +1620,16 @@ mod tests {
         app.write_library = false;
         app.favorites.clear();
         app.recent.clear();
+        app.saved_tracks.clear();
+        app.albums.clear();
+        app.artists.clear();
+        app.playlists.clear();
         app.queue.clear();
         app.recommendations = Recommendations::default();
         app.rebuild_library();
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
-        let (search_tx, search_jobs) = mpsc::channel::<SearchJob>();
+        let (search_tx, search_jobs) = mpsc::channel::<CatalogJob>();
         thread::spawn(move || while search_jobs.recv().is_ok() {});
         app.search_tx = search_tx;
         let (recommendation_tx, recommendation_jobs) = mpsc::channel::<SearchJob>();
@@ -1100,7 +1723,9 @@ mod tests {
         app.search_tx = tx;
         app.dispatch(Action::Discover("chill lofi music"), &ctx);
         assert_eq!(app.view, View::Search);
-        assert_eq!(jobs.recv().unwrap().query, "chill lofi music");
+        assert!(
+            matches!(jobs.recv().unwrap().request, CatalogRequest::Search(query, _, _) if query == "chill lofi music")
+        );
         assert_eq!(app.submitted_query, app.query);
         assert!(app.searching && app.queue.is_empty());
         assert!(commands.try_recv().is_err());
@@ -1330,8 +1955,8 @@ mod tests {
         app.dispatch(Action::Enqueue(b.clone(), true), &ctx);
         assert_eq!(app.queue, VecDeque::from([b.clone()]));
         assert_eq!(app.radio.as_ref().unwrap().upcoming, VecDeque::from([c]));
-        assert!(!app.can_queue_move(0, 1));
-        assert!(!app.can_queue_move(1, -1));
+        assert!(app.can_queue_move(0, 1));
+        assert!(app.can_queue_move(1, -1));
         app.dispatch(Action::StopRadio, &ctx);
         assert_eq!(app.queue, VecDeque::from([b]));
         assert!(commands.try_recv().is_err());
@@ -1434,6 +2059,204 @@ mod tests {
         assert_eq!(app.library, vec![a.clone()]);
         app.dispatch(Action::Favorite(a), &ctx);
         assert!(app.favorites.is_empty());
+    }
+    #[test]
+    fn playlists_edit_order_preserve_duplicates_and_play_as_a_collection() {
+        let (mut app, commands, _, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        let c = track("JGwWNGJdvx8");
+        app.dispatch(
+            Action::CreatePlaylist("  Mix  ".into(), vec![a.clone(), b.clone(), a.clone()]),
+            &ctx,
+        );
+        let id = app.playlists[0].id;
+        assert_eq!(app.playlists[0].title, "Mix");
+        app.dispatch(Action::RenamePlaylist(id, " ".into()), &ctx);
+        assert_eq!(app.playlists[0].title, "Mix");
+        app.dispatch(Action::PlaylistAdd(id, c.clone(), 1), &ctx);
+        app.dispatch(Action::PlaylistMove(id, 0, 4), &ctx);
+        assert_eq!(
+            app.playlists[0].tracks,
+            [c.clone(), b.clone(), a.clone(), a.clone()]
+        );
+        app.dispatch(Action::PlaylistRemove(id, 1), &ctx);
+        app.dispatch(Action::OpenPlaylist(id), &ctx);
+        assert_eq!(app.active_tracks(), [c.clone(), a.clone(), a.clone()]);
+        app.dispatch(Action::PlayTracks(app.active_tracks().to_vec()), &ctx);
+        assert_eq!(app.current, Some(c));
+        assert_eq!(app.queue, VecDeque::from([a.clone(), a]));
+        assert!(matches!(
+            commands.recv().unwrap(),
+            PlayerCommand::Play { .. }
+        ));
+        app.dispatch(Action::DeletePlaylist(id), &ctx);
+        assert_eq!(app.view, View::Playlists);
+        assert!(app.playlists.is_empty());
+    }
+    #[test]
+    fn queue_drops_insert_stably_across_radio_and_reject_stale_drags() {
+        let (mut app, commands, _, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        let c = track("JGwWNGJdvx8");
+        app.current = Some(a.clone());
+        app.queue = [a.clone(), b.clone(), c.clone()].into();
+        let drag = TrackDrag {
+            track: a.clone(),
+            origin: DragOrigin::Queue {
+                index: 0,
+                revision: app.queue_revision,
+            },
+        };
+        app.dispatch(Action::QueueDrop(drag.clone(), 3), &ctx);
+        assert_eq!(app.queue, VecDeque::from([b.clone(), c.clone(), a.clone()]));
+        app.dispatch(Action::QueueDrop(drag, 0), &ctx);
+        assert_eq!(app.queue, VecDeque::from([b.clone(), c.clone(), a.clone()]));
+        app.radio = Some(Radio::new(a.clone()));
+        app.radio.as_mut().unwrap().upcoming = [b.clone(), c.clone()].into();
+        app.queue = [a.clone()].into();
+        app.dispatch(
+            Action::QueueDrop(
+                TrackDrag {
+                    track: c.clone(),
+                    origin: DragOrigin::Queue {
+                        index: 2,
+                        revision: app.queue_revision,
+                    },
+                },
+                0,
+            ),
+            &ctx,
+        );
+        assert_eq!(app.queue, VecDeque::from([c.clone(), a.clone(), b.clone()]));
+        assert!(app.radio.as_ref().unwrap().upcoming.is_empty());
+        app.dispatch(
+            Action::QueueDrop(
+                TrackDrag {
+                    track: b.clone(),
+                    origin: DragOrigin::Track,
+                },
+                1,
+            ),
+            &ctx,
+        );
+        assert_eq!(app.queue, VecDeque::from([c, b.clone(), a.clone(), b]));
+        assert_eq!(app.current, Some(a));
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
+    fn playlist_drops_move_within_copy_across_and_ignore_outdated_positions() {
+        let (mut app, _, _, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        app.dispatch(
+            Action::CreatePlaylist("One".into(), vec![a.clone(), b.clone()]),
+            &ctx,
+        );
+        app.dispatch(Action::CreatePlaylist("Two".into(), vec![]), &ctx);
+        let first = app.playlists[0].id;
+        let second = app.playlists[1].id;
+        let drag = TrackDrag {
+            track: a.clone(),
+            origin: DragOrigin::Playlist {
+                id: first,
+                index: 0,
+                revision: app.playlist_revision,
+            },
+        };
+        app.dispatch(Action::PlaylistDrop(first, drag.clone(), 2), &ctx);
+        assert_eq!(app.playlists[0].tracks, [b.clone(), a.clone()]);
+        app.dispatch(Action::PlaylistDrop(first, drag.clone(), 0), &ctx);
+        assert_eq!(app.playlists[0].tracks, [b, a.clone()]);
+        app.dispatch(Action::PlaylistDrop(second, drag, 0), &ctx);
+        assert_eq!(app.playlists[1].tracks, [a]);
+        assert_eq!(app.playlists[0].tracks.len(), 2);
+    }
+    #[test]
+    fn catalog_results_cancel_on_navigation_and_collection_pages_keep_repeats() {
+        let (mut app, _, _, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let (tx, rx) = mpsc::channel();
+        app.search_rx = rx;
+        app.query = "Example".into();
+        app.dispatch(Action::Search, &ctx);
+        let stale = app.search_token;
+        app.dispatch(Action::Navigate(View::Library), &ctx);
+        tx.send(CatalogResult {
+            token: stale,
+            detail: false,
+            append: false,
+            result: Ok(vec![a.clone()].into()),
+        })
+        .unwrap();
+        app.receive();
+        assert!(app.results.is_empty());
+        tx.send(CatalogResult {
+            token: app.search_token,
+            detail: true,
+            append: false,
+            result: Ok(vec![a.clone()].into()),
+        })
+        .unwrap();
+        tx.send(CatalogResult {
+            token: app.search_token,
+            detail: true,
+            append: true,
+            result: Ok(vec![a.clone()].into()),
+        })
+        .unwrap();
+        app.receive();
+        assert_eq!(app.detail.tracks, [a.clone(), a]);
+    }
+    #[test]
+    fn saved_albums_are_available_immediately_and_back_restores_collection() {
+        let (mut app, _, _, ctx) = fixture();
+        let collection = Collection {
+            id: "MPREalbum".into(),
+            title: "Album".into(),
+            subtitle: "Artist".into(),
+            kind: CollectionKind::Album,
+            thumbnail: None,
+            params: None,
+        };
+        let a = track("dQw4w9WgXcQ");
+        app.albums.push(SavedAlbum {
+            collection: collection.clone(),
+            tracks: vec![a.clone()],
+        });
+        app.dispatch(Action::OpenCollection(collection.clone()), &ctx);
+        assert_eq!(app.active_tracks(), std::slice::from_ref(&a));
+        app.dispatch(Action::CreatePlaylist("Mix".into(), vec![a]), &ctx);
+        app.dispatch(Action::OpenPlaylist(app.playlists[0].id), &ctx);
+        app.dispatch(Action::Back, &ctx);
+        assert_eq!(app.collection, Some(collection));
+        assert!(app.playlist_id.is_none());
+        assert_eq!(app.detail.tracks.len(), 1);
+    }
+    #[test]
+    fn volume_and_queue_edits_share_snapshots_and_collection_edits_replace_them() {
+        let (mut app, _, _, ctx) = fixture();
+        let track = track("dQw4w9WgXcQ");
+        app.dispatch(
+            Action::CreatePlaylist("Mix".into(), vec![track.clone(); 1000]),
+            &ctx,
+        );
+        let first = app.collection_snapshot();
+        app.dispatch(Action::Volume(30), &ctx);
+        app.dispatch(Action::Enqueue(track.clone(), false), &ctx);
+        let unchanged = app.collection_snapshot();
+        assert!(Arc::ptr_eq(&first.playlists, &unchanged.playlists));
+        app.dispatch(Action::PlaylistRemove(app.playlists[0].id, 0), &ctx);
+        let edited = app.collection_snapshot();
+        assert!(!Arc::ptr_eq(&first.playlists, &edited.playlists));
+        assert_eq!(first.playlists[0].tracks.len(), 1000);
+        assert_eq!(edited.playlists[0].tracks.len(), 999);
+        app.dispatch(Action::SaveTrack(track.clone()), &ctx);
+        app.dispatch(Action::LibraryTab(LibraryTab::Saved), &ctx);
+        assert_eq!(app.library, [track]);
+        app.dispatch(Action::LibraryTab(LibraryTab::Recent), &ctx);
+        assert!(app.library.is_empty());
     }
     #[test]
     fn mute_restores_volume_and_seek_requires_real_capability() {

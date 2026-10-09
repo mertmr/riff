@@ -1,4 +1,5 @@
 mod app;
+mod catalog;
 mod model;
 mod player;
 #[cfg(feature = "ui-qa")]

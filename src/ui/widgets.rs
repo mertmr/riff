@@ -262,13 +262,59 @@ pub struct Row<'a> {
     pub queue: bool,
     pub radio: bool,
     pub queue_range: std::ops::Range<usize>,
+    pub saved: bool,
+    pub queue_revision: u64,
+    pub playlist: Option<(u64, u64)>,
 }
 pub fn track_row(ui: &mut Ui, art: &mut Artwork, row: Row<'_>, actions: &mut Vec<Action>) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 64.), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let response = ui.interact(rect, ui.id().with(("row", row.index)), Sense::click());
+    let response = ui.interact(
+        rect,
+        ui.id().with(("row", row.index)),
+        Sense::click_and_drag(),
+    );
+    use crate::app::{DragOrigin, TrackDrag};
+    if response.drag_started() {
+        response.dnd_set_drag_payload(TrackDrag {
+            track: row.track.clone(),
+            origin: if row.queue {
+                DragOrigin::Queue {
+                    index: row.index,
+                    revision: row.queue_revision,
+                }
+            } else if let Some((id, revision)) = row.playlist {
+                DragOrigin::Playlist {
+                    id,
+                    index: row.index,
+                    revision,
+                }
+            } else {
+                DragOrigin::Track
+            },
+        });
+    }
+    if (row.queue || row.playlist.is_some()) && response.dnd_hover_payload::<TrackDrag>().is_some()
+    {
+        let below = ui.input(|i| {
+            i.pointer
+                .interact_pos()
+                .is_some_and(|p| p.y > rect.center().y)
+        });
+        let y = if below { rect.bottom() } else { rect.top() };
+        ui.painter()
+            .hline(rect.x_range(), y, Stroke::new(2., ACCENT));
+        if let Some(drag) = response.dnd_release_payload::<TrackDrag>() {
+            let slot = row.index + usize::from(below);
+            actions.push(if row.queue {
+                Action::QueueDrop((*drag).clone(), slot)
+            } else {
+                Action::PlaylistDrop(row.playlist.unwrap().0, (*drag).clone(), slot)
+            });
+        }
+    }
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
@@ -412,12 +458,90 @@ pub fn track_row(ui: &mut Ui, art: &mut Artwork, row: Row<'_>, actions: &mut Vec
             ui.close();
         }
         if ui.button("Play next").clicked() {
-            actions.push(Action::Enqueue(row.track.clone(), true));
+            actions.push(if row.queue {
+                Action::QueueDrop(
+                    TrackDrag {
+                        track: row.track.clone(),
+                        origin: DragOrigin::Queue {
+                            index: row.index,
+                            revision: row.queue_revision,
+                        },
+                    },
+                    0,
+                )
+            } else {
+                Action::Enqueue(row.track.clone(), true)
+            });
             ui.close();
         }
         if ui.button("Add to queue").clicked() {
             actions.push(Action::Enqueue(row.track.clone(), false));
             ui.close();
+        }
+        if ui.button("Add to playlist…").clicked() {
+            actions.push(Action::AddToPlaylist(row.track.clone()));
+            ui.close();
+        }
+        if ui
+            .button(if row.saved {
+                "Remove from saved songs"
+            } else {
+                "Save to library"
+            })
+            .clicked()
+        {
+            actions.push(Action::SaveTrack(row.track.clone()));
+            ui.close();
+        }
+        if let Some(id) = &row.track.artist_id
+            && ui.button("Go to artist").clicked()
+        {
+            actions.push(Action::OpenCollection(crate::model::Collection {
+                id: id.clone(),
+                title: row.track.artist.clone(),
+                subtitle: String::new(),
+                kind: crate::model::CollectionKind::Artist,
+                thumbnail: None,
+                params: None,
+            }));
+            ui.close();
+        }
+        if let (Some(id), Some(title)) = (&row.track.album_id, &row.track.album)
+            && ui.button("Go to album").clicked()
+        {
+            actions.push(Action::OpenCollection(crate::model::Collection {
+                id: id.clone(),
+                title: title.clone(),
+                subtitle: row.track.artist.clone(),
+                kind: crate::model::CollectionKind::Album,
+                thumbnail: None,
+                params: None,
+            }));
+            ui.close();
+        }
+        if let Some((id, _)) = row.playlist {
+            ui.separator();
+            if ui
+                .add_enabled(row.index > 0, egui::Button::new("Move up"))
+                .clicked()
+            {
+                actions.push(Action::PlaylistMove(id, row.index, row.index - 1));
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    row.index + 1 < row.queue_range.end,
+                    egui::Button::new("Move down"),
+                )
+                .clicked()
+            {
+                actions.push(Action::PlaylistMove(id, row.index, row.index + 2));
+                ui.close();
+            }
+            if ui.button("Remove from playlist").clicked() {
+                actions.push(Action::PlaylistRemove(id, row.index));
+                ui.close();
+            }
         }
         if ui
             .button(if row.liked {
@@ -498,6 +622,85 @@ pub fn empty(ui: &mut Ui, icon: Icon, title: &str, description: &str, action: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_drags_reorder_queue_and_playlist_without_playing() {
+        for queue in [true, false] {
+            let ctx = egui::Context::default();
+            let mut artwork = Artwork::default();
+            let tracks: Vec<_> = (0..3)
+                .map(|i| crate::model::Track {
+                    id: format!("{i:011}"),
+                    title: format!("Song {i}"),
+                    artist: "Artist".into(),
+                    ..Default::default()
+                })
+                .collect();
+            let mut actions = Vec::new();
+            let mut frame = |events| {
+                actions.clear();
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400., 260.))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.;
+                        for (index, track) in tracks.iter().enumerate() {
+                            track_row(
+                                ui,
+                                &mut artwork,
+                                Row {
+                                    track,
+                                    index,
+                                    current: false,
+                                    playing: false,
+                                    liked: false,
+                                    selected: false,
+                                    queue,
+                                    radio: false,
+                                    queue_range: 0..3,
+                                    saved: false,
+                                    queue_revision: 7,
+                                    playlist: (!queue).then_some((42, 7)),
+                                },
+                                &mut actions,
+                            );
+                        }
+                    },
+                );
+                output.textures_delta.clear();
+                std::mem::take(&mut actions)
+            };
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(vec![]);
+            frame(vec![
+                egui::Event::PointerMoved(pos2(120., 28.)),
+                button(pos2(120., 28.), true),
+            ]);
+            frame(vec![egui::Event::PointerMoved(pos2(120., 44.))]);
+            assert!(egui::DragAndDrop::has_payload_of_type::<
+                crate::app::TrackDrag,
+            >(&ctx));
+            frame(vec![egui::Event::PointerMoved(pos2(120., 180.))]);
+            let actions = frame(vec![button(pos2(120., 180.), false)]);
+            if queue {
+                assert!(
+                    matches!(actions.as_slice(), [Action::QueueDrop(drag, 3)] if drag.track.id == tracks[0].id)
+                );
+            } else {
+                assert!(
+                    matches!(actions.as_slice(), [Action::PlaylistDrop(42, drag, 3)] if drag.track.id == tracks[0].id)
+                );
+            }
+        }
+    }
 
     #[test]
     fn accessible_sliders_commit_real_values_and_respect_disabled_state() {

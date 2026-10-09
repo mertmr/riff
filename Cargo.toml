@@ -10,7 +10,7 @@ description = "A lightweight native Rust music client for YouTube"
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "accesskit", "default_fonts", "x11", "wayland"] }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 directories = "6"
 

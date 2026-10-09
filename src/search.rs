@@ -153,6 +153,9 @@ pub fn parse_search_results(bytes: &[u8]) -> Result<Vec<Track>, String> {
                 title: title.to_owned(),
                 artist: artist.to_owned(),
                 duration_seconds,
+                artist_id: None,
+                album: item["album"].as_str().map(str::to_owned),
+                album_id: None,
             })
         })
         .collect())

@@ -36,6 +36,7 @@ struct Entry {
 struct Job {
     id: String,
     ticket: u64,
+    url: String,
     ctx: egui::Context,
 }
 struct Loaded {
@@ -85,7 +86,7 @@ impl Default for Artwork {
                         if shutdown.load(Ordering::Relaxed) {
                             break;
                         }
-                        let image = fetch_image(&agent, dir.as_deref(), &job.id).ok();
+                        let image = fetch_image(&agent, dir.as_deref(), &job.id, &job.url).ok();
                         if shutdown.load(Ordering::Relaxed) {
                             break;
                         }
@@ -158,27 +159,41 @@ impl Artwork {
         }
     }
     pub fn paint(&mut self, ui: &Ui, track: &Track, rect: Rect, radius: u8) {
+        if !is_valid_video_id(&track.id) {
+            widgets::placeholder(ui, rect, radius, Icon::Music);
+            return;
+        }
+        self.paint_url(
+            ui,
+            &track.id,
+            &Track::artwork_url_for(&track.id),
+            rect,
+            radius,
+        );
+    }
+    pub fn paint_url(&mut self, ui: &Ui, id: &str, url: &str, rect: Rect, radius: u8) {
         self.receive(ui.ctx());
         if !ui.is_rect_visible(rect) {
             return;
         }
         self.clock = self.clock.wrapping_add(1);
-        let retry = self.entries.get(&track.id).is_none_or(
+        let retry = self.entries.get(id).is_none_or(
             |entry| matches!(entry.state, State::Failed(until) if Instant::now() >= until),
         );
-        if retry && is_valid_video_id(&track.id) {
+        if retry && valid_artwork_url(url) {
             self.next_ticket = self.next_ticket.wrapping_add(1);
             if self
                 .jobs
                 .try_send(Job {
-                    id: track.id.clone(),
+                    id: id.to_owned(),
                     ticket: self.next_ticket,
+                    url: url.to_owned(),
                     ctx: ui.ctx().clone(),
                 })
                 .is_ok()
             {
                 self.entries.insert(
-                    track.id.clone(),
+                    id.to_owned(),
                     Entry {
                         state: State::Pending,
                         used: self.clock,
@@ -188,7 +203,7 @@ impl Artwork {
                 );
             }
         }
-        let Some(entry) = self.entries.get_mut(&track.id) else {
+        let Some(entry) = self.entries.get_mut(id) else {
             widgets::placeholder(ui, rect, radius, Icon::Music);
             return;
         };
@@ -233,8 +248,37 @@ impl Drop for Artwork {
     }
 }
 
-fn fetch_image(agent: &ureq::Agent, dir: Option<&Path>, id: &str) -> Result<ColorImage, String> {
-    let path = dir.map(|dir| dir.join(format!("{id}.jpg")));
+fn valid_artwork_url(url: &str) -> bool {
+    [
+        "https://i.ytimg.com/",
+        "https://yt3.googleusercontent.com/",
+        "https://lh3.googleusercontent.com/",
+        "https://yt3.ggpht.com/",
+    ]
+    .iter()
+    .any(|host| url.starts_with(host))
+}
+
+fn fetch_image(
+    agent: &ureq::Agent,
+    dir: Option<&Path>,
+    id: &str,
+    url: &str,
+) -> Result<ColorImage, String> {
+    if !valid_artwork_url(url) {
+        return Err("Invalid artwork URL".into());
+    }
+    // Catalog IDs and URLs never become filesystem paths.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    let path = dir.map(|dir| {
+        dir.join(if is_valid_video_id(id) {
+            format!("{id}.jpg")
+        } else {
+            format!("{:016x}.jpg", hasher.finish())
+        })
+    });
     if let Some(path) = &path
         && let Ok(file) = fs::File::open(path)
     {
@@ -245,9 +289,8 @@ fn fetch_image(agent: &ureq::Agent, dir: Option<&Path>, id: &str) -> Result<Colo
             return Ok(image);
         }
     }
-    let url = Track::artwork_url_for(id);
     let bytes = agent
-        .get(&url)
+        .get(url)
         .call()
         .map_err(|e| e.to_string())?
         .body_mut()

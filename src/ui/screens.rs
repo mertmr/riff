@@ -37,6 +37,9 @@ pub fn sidebar(app: &MusicApp, ui: &mut Ui, compact: bool, actions: &mut Vec<Act
         (View::Search, Icon::Search, "Search"),
         (View::Library, Icon::Library, "Library"),
         (View::Favorites, Icon::Heart, "Favorites"),
+        (View::Albums, Icon::Music, "Albums"),
+        (View::Artists, Icon::Music, "Artists"),
+        (View::Playlists, Icon::Library, "Playlists"),
     ] {
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 48.), Sense::hover());
         let response = ui.interact(rect, ui.id().with(view), Sense::click());
@@ -75,6 +78,11 @@ pub fn sidebar(app: &MusicApp, ui: &mut Ui, compact: bool, actions: &mut Vec<Act
         }
         if response.clicked() {
             actions.push(Action::Navigate(view));
+        }
+        if view == View::Playlists
+            && let Some(drag) = response.dnd_release_payload::<crate::app::TrackDrag>()
+        {
+            actions.push(Action::AddToPlaylist(drag.track.clone()));
         }
         response.on_hover_text(if view == View::Search {
             "Search · Ctrl/Cmd+K"
@@ -233,7 +241,10 @@ pub fn topbar(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                         [search_width - 148., 32.],
                         egui::TextEdit::singleline(&mut app.query)
                             .id(egui::Id::new("global_search"))
-                            .hint_text(RichText::new("Search songs, artists, albums").color(MUTED))
+                            .hint_text(
+                                RichText::new("Search songs, artists, albums, playlists")
+                                    .color(MUTED),
+                            )
                             .text_color(TEXT)
                             .frame(egui::Frame::NONE)
                             .margin(egui::Margin::ZERO)
@@ -279,6 +290,13 @@ pub fn topbar(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
             });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (r, _) = ui.allocate_exact_size(vec2(40., 40.), Sense::hover());
+            let drop = ui.interact(r, ui.id().with("queue_drop"), Sense::hover());
+            if let Some(drag) = drop.dnd_release_payload::<crate::app::TrackDrag>() {
+                actions.push(Action::QueueDrop((*drag).clone(), app.queue_len()));
+                if !app.queue_open {
+                    actions.push(Action::ToggleQueue);
+                }
+            }
             if widgets::icon_button(
                 ui,
                 "top_queue",
@@ -300,8 +318,12 @@ pub fn topbar(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
 pub fn content(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     match app.view {
         View::Home => home(app, ui, actions),
-        View::Search => search(app, ui, actions),
+        View::Search => super::collections::search(app, ui, actions),
         View::Library | View::Favorites => library(app, ui, actions),
+        View::Albums | View::Artists | View::Playlists => {
+            super::collections::library(app, ui, actions)
+        }
+        View::Collection => super::collections::detail(app, ui, actions),
     }
 }
 fn home(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -598,7 +620,14 @@ fn track_shelf(
                             ui.allocate_exact_size(vec2(width, width + 100.), Sense::hover());
                         let selected = selectable && app.selected == Some(i);
                         let play_rect = Rect::from_min_size(r.min, vec2(width, width + 64.));
-                        let response = ui.interact(play_rect, ui.id().with("play"), Sense::click());
+                        let response =
+                            ui.interact(play_rect, ui.id().with("play"), Sense::click_and_drag());
+                        if response.drag_started() {
+                            response.dnd_set_drag_payload(crate::app::TrackDrag {
+                                track: track.clone(),
+                                origin: crate::app::DragOrigin::Track,
+                            });
+                        }
                         response.widget_info(|| {
                             egui::WidgetInfo::selected(
                                 egui::WidgetType::SelectableLabel,
@@ -744,129 +773,6 @@ fn quick_card(
         actions.push(action);
     }
 }
-fn search(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
-    if !app.searching && app.search_error.is_none() && !app.results.is_empty() {
-        ui.label(RichText::new("Search results").font(bold(28.)));
-        ui.add(
-            egui::Label::new(
-                RichText::new(format!(
-                    "{} tracks for “{}”",
-                    app.results.len(),
-                    app.submitted_query
-                ))
-                .color(MUTED),
-            )
-            .truncate(),
-        )
-        .on_hover_text(&app.submitted_query);
-        ui.add_space(16.);
-        tracks(app, ui, actions, "search_results");
-        return;
-    }
-
-    widgets::heading(
-        ui,
-        "Find your next favorite",
-        "Songs, artists, albums — one search away.",
-    );
-    ui.add_space(16.);
-    ui.horizontal(|ui| {
-        if widgets::button(
-            ui,
-            if app.searching {
-                "Search again"
-            } else {
-                "Search YouTube"
-            },
-            true,
-        )
-        .clicked()
-        {
-            actions.push(Action::Search);
-        }
-        if app.searching {
-            ui.spinner();
-            ui.label(RichText::new("Finding your music…").color(MUTED));
-            if widgets::button(ui, "Cancel", false).clicked() {
-                actions.push(Action::CancelSearch);
-            }
-        } else {
-            ui.label(
-                RichText::new("Enter to search · ↑ ↓ to select · Enter to play")
-                    .size(11.)
-                    .color(DIM),
-            );
-        }
-    });
-    ui.add_space(24.);
-    if app.searching {
-        // Stable rows communicate work without jumping or showing stale results.
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for i in 0..6 {
-                    let (r, _) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 64.), Sense::hover());
-                    let alpha =
-                        (0.7 + 0.2 * (ui.input(|i| i.time) * 2. + i as f64 * 0.2).sin()) as f32;
-                    ui.painter().rect_filled(
-                        Rect::from_min_size(r.min + vec2(8., 8.), vec2(48., 48.)),
-                        6,
-                        SURFACE.gamma_multiply(alpha),
-                    );
-                    for (y, w) in [(14., 0.48), (38., 0.28)] {
-                        ui.painter().rect_filled(
-                            Rect::from_min_size(r.min + vec2(72., y), vec2(r.width() * w, 10.)),
-                            4,
-                            SURFACE.gamma_multiply(alpha),
-                        );
-                    }
-                }
-            });
-        return;
-    }
-    if let Some(error) = &app.search_error {
-        if widgets::empty(
-            ui,
-            Icon::Search,
-            "Couldn't find your music",
-            error,
-            "Try again",
-        ) {
-            actions.push(Action::Search);
-        }
-    } else if app.results.is_empty() {
-        if app.search_done {
-            widgets::empty(
-                ui,
-                Icon::Search,
-                "No matches this time",
-                "Try a different title, artist, or a shorter search.",
-                "",
-            );
-        } else {
-            widgets::empty(
-                ui,
-                Icon::Music,
-                "The next song is out there",
-                "Type a song, artist, or album above and press Enter.",
-                "",
-            );
-        }
-    } else {
-        ui.horizontal(|ui| {
-            widgets::caption(ui, "SEARCH RESULTS");
-            ui.label(
-                RichText::new(format!("{} tracks", app.results.len()))
-                    .size(12.)
-                    .color(MUTED),
-            );
-        });
-        ui.label(RichText::new(&app.submitted_query).font(bold(20.)));
-        ui.add_space(12.);
-        tracks(app, ui, actions, "search_results");
-    }
-}
 fn library(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     let favorites = app.view == View::Favorites;
     if favorites {
@@ -901,6 +807,7 @@ fn library(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
         } else {
             for (tab, label) in [
                 (LibraryTab::All, "All music"),
+                (LibraryTab::Saved, "Saved"),
                 (LibraryTab::Favorites, "Favorites"),
                 (LibraryTab::Recent, "Recent"),
             ] {
@@ -1040,6 +947,9 @@ fn tracks(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>, id: &str) 
                     queue: false,
                     radio: false,
                     queue_range: 0..0,
+                    saved: app.saved_tracks.iter().any(|t| t.id == track.id),
+                    queue_revision: app.queue_revision,
+                    playlist: None,
                 },
                 actions,
             );

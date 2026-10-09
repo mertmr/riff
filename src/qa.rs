@@ -1,7 +1,7 @@
 //! Opt-in visual fixtures and captures. This module is excluded from normal builds.
 use crate::{
     app::{Action, MusicApp, Playback, Recommendations, View},
-    model::Track,
+    model::{Collection, CollectionKind, Playlist, SavedAlbum, Track},
     radio::Radio,
 };
 use eframe::egui;
@@ -67,6 +67,10 @@ pub fn configure(app: &mut MusicApp) {
         return;
     }
     app.write_library = false;
+    app.saved_tracks.clear();
+    app.albums.clear();
+    app.artists.clear();
+    app.playlists.clear();
     app.qa = Some(Capture {
         path,
         start: Instant::now(),
@@ -84,10 +88,48 @@ pub fn configure(app: &mut MusicApp) {
             ("JGwWNGJdvx8","Shape of You","Ed Sheeran",Some(263)),
             ("RgKAFK5djSk","See You Again (feat. Charlie Puth) — a very long song title that should gracefully truncate at every window size","Wiz Khalifa and an unusually long list of guest artists",Some(237)),
             ("00000000000","Missing artwork and unavailable duration","Unknown artist",None),
-        ].into_iter().map(|(id,title,artist,duration_seconds)| Track {id:id.into(),title:title.into(),artist:artist.into(),duration_seconds}).collect::<Vec<_>>();
+        ].into_iter().map(|(id,title,artist,duration_seconds)| Track {id:id.into(),title:title.into(),artist:artist.into(),duration_seconds,..Default::default()}).collect::<Vec<_>>();
         app.favorites = tracks.iter().skip(1).take(6).cloned().collect();
         app.recent = tracks.clone();
         app.results = tracks.clone();
+        let album = Collection {
+            id: "MPREalbum-fixture".into(),
+            title: "After Hours".into(),
+            subtitle: "The Weeknd · 2020".into(),
+            kind: CollectionKind::Album,
+            thumbnail: None,
+            params: None,
+        };
+        let artist = Collection {
+            id: "UCartist-fixture".into(),
+            title: "The Weeknd".into(),
+            subtitle: "Artist".into(),
+            kind: CollectionKind::Artist,
+            thumbnail: None,
+            params: None,
+        };
+        app.albums.push(SavedAlbum {
+            collection: album.clone(),
+            tracks: tracks.iter().skip(1).take(2).cloned().collect(),
+        });
+        app.artists.push(artist.clone());
+        app.playlists.push(Playlist {
+            id: 1,
+            title: "Evening favorites".into(),
+            tracks: tracks.iter().skip(1).cloned().collect(),
+        });
+        app.search_collections = vec![
+            album,
+            artist,
+            Collection {
+                id: "VLplaylist-fixture".into(),
+                title: "Late night music".into(),
+                subtitle: "YouTube Music · 50 songs".into(),
+                kind: CollectionKind::Playlist,
+                thumbnail: None,
+                params: None,
+            },
+        ];
         app.queue = tracks.iter().skip(2).cloned().collect();
         app.current = Some(tracks[1].clone());
         app.playback = Playback::Paused;
@@ -143,6 +185,32 @@ pub fn configure(app: &mut MusicApp) {
         }
         Ok("search") => app.view = View::Search,
         Ok("library") => app.view = View::Library,
+        Ok("albums") => app.view = View::Albums,
+        Ok("artists") => app.view = View::Artists,
+        Ok("playlists") => app.view = View::Playlists,
+        Ok("playlist" | "playlist-editor") => {
+            app.view = View::Collection;
+            app.playlist_id = app.playlists.first().map(|p| p.id);
+            if std::env::var("RIFF_VIEW").as_deref() == Ok("playlist-editor") {
+                app.playlist_editor = Some(crate::app::PlaylistEditor::Create {
+                    title: "My new playlist".into(),
+                    tracks: vec![],
+                });
+            }
+        }
+        Ok("album") => {
+            app.view = View::Collection;
+            if let Some(album) = app.albums.first() {
+                app.collection = Some(album.collection.clone());
+                app.detail.tracks = album.tracks.clone();
+            }
+        }
+        Ok("artist") => {
+            app.view = View::Collection;
+            app.collection = app.artists.first().cloned();
+            app.detail.tracks = app.results.iter().skip(1).take(2).cloned().collect();
+            app.detail.collections = app.albums.iter().map(|a| a.collection.clone()).collect();
+        }
         Ok("favorites") => app.view = View::Favorites,
         Ok("queue") => {
             app.view = View::Search;

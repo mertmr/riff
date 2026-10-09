@@ -1,4 +1,5 @@
 mod artwork;
+mod collections;
 pub mod icons;
 mod player_bar;
 mod queue;
@@ -84,6 +85,22 @@ pub fn show(app: &mut MusicApp, ui: &mut egui::Ui) {
                         });
                     });
             });
+    }
+    collections::editor(app, ui.ctx(), &mut actions);
+    if let Some(drag) = egui::DragAndDrop::payload::<crate::app::TrackDrag>(ui.ctx()) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+            egui::Area::new(egui::Id::new("track_drag_preview"))
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .fixed_pos(pointer + egui::vec2(16., 16.))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(240.);
+                        ui.label(&drag.track.title);
+                    });
+                });
+        }
     }
     let ctx = ui.ctx().clone();
     for action in actions {

@@ -38,7 +38,7 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                     }
                 });
             });
-            ui.add_space(16.);
+            ui.add_space(8.);
             widgets::caption(ui, "NOW PLAYING");
             ui.add_space(8.);
             if let Some(track) = &app.current {
@@ -72,15 +72,23 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
             } else {
                 ui.label(RichText::new("Nothing playing yet").size(12.).color(MUTED));
             }
-            ui.add_space(16.);
+            ui.add_space(8.);
             radio_controls(app, ui, actions);
-            ui.add_space(16.);
+            ui.add_space(8.);
             ui.horizontal(|ui| {
                 widgets::caption(ui, &format!("UP NEXT · {}", app.queue_len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(app.queue_len() > 0, |ui| {
-                        if widgets::button(ui, "Clear", false).clicked() {
+                        if ui.small_button("Clear").clicked() {
                             actions.push(Action::ClearQueue);
+                        }
+                        if ui.small_button("Save playlist").clicked() {
+                            app.playlist_editor = Some(crate::app::PlaylistEditor::Create {
+                                title: "Queue".into(),
+                                tracks: (0..app.queue_len())
+                                    .filter_map(|i| app.queue_track(i).cloned())
+                                    .collect(),
+                            });
                         }
                     });
                 });
@@ -125,7 +133,7 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                 });
             } else {
                 ui.label(
-                    RichText::new("Select to move · Click artwork to play")
+                    RichText::new("Drag to reorder · Click artwork to play")
                         .size(10.)
                         .color(DIM),
                 );
@@ -156,6 +164,8 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.;
                     let mut scroll = egui::ScrollArea::vertical()
+                        .max_height((ui.available_height() - 52.).max(32.))
+                        .min_scrolled_height(32.)
                         .id_salt("queue_scroll")
                         .auto_shrink([false, false]);
                     let last = ui
@@ -171,7 +181,7 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                             )
                             .map_or(0., |s| s.offset.y);
                             let y = i as f32 * 64.;
-                            let h = ui.available_height();
+                            let h = (ui.available_height() - 52.).max(32.);
                             scroll = scroll.vertical_scroll_offset(if y < offset {
                                 y
                             } else if y + 64. > offset + h {
@@ -185,13 +195,10 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                         }
                     }
                     scroll.show_rows(ui, 64., app.queue_len(), |ui, range| {
+                        super::collections::auto_scroll(ui);
                         for i in range {
                             let track = app.queue_track(i).unwrap().clone();
-                            let queue_range = if i < app.queue.len() {
-                                0..app.queue.len()
-                            } else {
-                                app.queue.len()..app.queue_len()
-                            };
+                            let queue_range = 0..app.queue_len();
                             widgets::track_row(
                                 ui,
                                 &mut app.artwork,
@@ -205,6 +212,9 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                                     queue: true,
                                     radio: i >= app.queue.len(),
                                     queue_range,
+                                    saved: app.saved_tracks.iter().any(|t| t.id == track.id),
+                                    queue_revision: app.queue_revision,
+                                    playlist: None,
                                 },
                                 actions,
                             );
@@ -212,6 +222,12 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                     });
                 });
             }
+            super::collections::drop_zone(
+                ui,
+                "Drop tracks here to add to queue",
+                |drag| Action::QueueDrop(drag, app.queue_len()),
+                actions,
+            );
         });
 }
 

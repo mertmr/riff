@@ -59,6 +59,7 @@ mod tests {
             title: "Song".into(),
             artist: "Artist".into(),
             duration_seconds: Some(180),
+            ..Default::default()
         }
     }
     #[test]
