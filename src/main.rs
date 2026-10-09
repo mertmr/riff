@@ -1,4 +1,5 @@
 mod app;
+mod audio_cache;
 mod model;
 mod player;
 #[cfg(feature = "ui-qa")]

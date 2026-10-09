@@ -53,7 +53,9 @@ fn now_playing(app: &mut MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Actio
             12.,
             MUTED,
         );
-        let status = if app.buffering {
+        let status = if app.recovering {
+            "Reconnecting audio…"
+        } else if app.buffering {
             "Buffering…"
         } else {
             match app.playback {

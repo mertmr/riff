@@ -146,6 +146,7 @@ pub struct MusicApp {
     pub search_done: bool,
     pub playback: Playback,
     pub buffering: bool,
+    pub recovering: bool,
     pub position: f64,
     pub duration: Option<f64>,
     pub seekable: bool,
@@ -174,6 +175,7 @@ pub struct MusicApp {
     player_rx: Receiver<PlayerEvent>,
     player_worker: Option<thread::JoinHandle<()>>,
     writer: LibraryWriter,
+    checkpoint: Instant,
     #[cfg(feature = "ui-qa")]
     pub qa: Option<crate::qa::Capture>,
 }
@@ -182,8 +184,16 @@ impl MusicApp {
         Self::from_context(&cc.egui_ctx)
     }
     fn from_context(ctx: &egui::Context) -> Self {
-        ui::theme::install(ctx);
         let (favorites, session, global_error) = storage::load_library();
+        Self::from_library(ctx, favorites, session, global_error)
+    }
+    fn from_library(
+        ctx: &egui::Context,
+        favorites: Vec<Track>,
+        session: Session,
+        global_error: Option<String>,
+    ) -> Self {
+        ui::theme::install(ctx);
         let (search_tx, jobs) = mpsc::channel::<SearchJob>();
         let (result_tx, search_rx) = mpsc::channel();
         let search_epoch = Arc::new(AtomicU64::new(0));
@@ -256,7 +266,7 @@ impl MusicApp {
             queue: session.queue.into(),
             radio: None,
             recommendations: Recommendations::default(),
-            current: None,
+            current: session.current.clone(),
             history: Vec::new(),
             view: View::Home,
             selected: None,
@@ -267,9 +277,14 @@ impl MusicApp {
             searching: false,
             search_error: None,
             search_done: false,
-            playback: Playback::Empty,
+            playback: if session.current.is_some() {
+                Playback::Stopped
+            } else {
+                Playback::Empty
+            },
             buffering: false,
-            position: 0.,
+            recovering: false,
+            position: session.position,
             duration: None,
             seekable: false,
             volume: session.volume,
@@ -297,6 +312,7 @@ impl MusicApp {
             player_rx,
             player_worker: Some(worker),
             writer: LibraryWriter::new(ctx.clone()),
+            checkpoint: Instant::now(),
             #[cfg(feature = "ui-qa")]
             qa: None,
         };
@@ -327,6 +343,8 @@ impl MusicApp {
                 recent: self.recent.clone(),
                 queue: self.queue.iter().cloned().collect(),
                 volume: self.volume,
+                current: self.current.clone(),
+                position: self.position,
             },
         );
     }
@@ -360,6 +378,9 @@ impl MusicApp {
         self.selected = None;
     }
     fn play(&mut self, track: Track, add_history: bool) {
+        self.play_from(track, add_history, 0.);
+    }
+    fn play_from(&mut self, track: Track, add_history: bool, position: f64) {
         if let Some(radio) = &mut self.radio {
             radio.waiting = false;
             radio.remember(&track.id);
@@ -378,7 +399,8 @@ impl MusicApp {
         self.current = Some(track.clone());
         self.playback = Playback::Loading;
         self.buffering = false;
-        self.position = 0.;
+        self.recovering = false;
+        self.position = position;
         self.duration = None;
         self.seekable = false;
         self.playback_error = None;
@@ -387,6 +409,8 @@ impl MusicApp {
             .send(PlayerCommand::Play {
                 track,
                 generation: self.generation,
+                position,
+                paused: false,
             })
             .is_err()
         {
@@ -394,6 +418,8 @@ impl MusicApp {
             self.playback_error =
                 Some("The audio worker stopped. Restart Riff to reconnect.".into());
         }
+        self.checkpoint = Instant::now();
+        self.persist();
     }
     fn next(&mut self) {
         let track = self.queue.pop_front().or_else(|| {
@@ -411,6 +437,9 @@ impl MusicApp {
             let _ = self.player_tx.send(PlayerCommand::Stop);
             self.playback = Playback::Stopped;
             self.buffering = false;
+            self.recovering = false;
+            self.position = 0.;
+            self.persist();
             if let Some(radio) = &mut self.radio {
                 radio.waiting = true;
             }
@@ -577,6 +606,8 @@ impl MusicApp {
             match message.event {
                 PlaybackEvent::Ready => {
                     self.playback = Playback::Playing;
+                    self.recovering = false;
+                    self.buffering = false;
                     if let Some(track) = &self.current {
                         self.recent.retain(|t| t.id != track.id);
                         self.recent.insert(0, track.clone());
@@ -585,6 +616,13 @@ impl MusicApp {
                         self.persist();
                     }
                 }
+                PlaybackEvent::Recovering => {
+                    self.playback = Playback::Loading;
+                    self.recovering = true;
+                    self.buffering = false;
+                    self.seekable = false;
+                    self.persist();
+                }
                 PlaybackEvent::Paused(paused) => {
                     if matches!(self.playback, Playback::Playing | Playback::Paused) {
                         self.playback = if paused {
@@ -592,16 +630,25 @@ impl MusicApp {
                         } else {
                             Playback::Playing
                         };
+                        self.persist();
                     }
                 }
                 PlaybackEvent::Buffering(value) => self.buffering = value,
-                PlaybackEvent::Position(value) => self.position = value,
+                PlaybackEvent::Position(value) => {
+                    self.position = value;
+                    if self.checkpoint.elapsed() >= Duration::from_secs(5) {
+                        self.checkpoint = Instant::now();
+                        self.persist();
+                    }
+                }
                 PlaybackEvent::Duration(value) => self.duration = Some(value),
                 PlaybackEvent::Seekable(value) => self.seekable = value,
                 PlaybackEvent::Volume(value) => self.volume = value,
                 PlaybackEvent::Stopped => {
                     self.playback = Playback::Stopped;
                     self.buffering = false;
+                    self.recovering = false;
+                    self.persist();
                 }
                 PlaybackEvent::Ended => self.next(),
                 PlaybackEvent::Error(e) => {
@@ -609,6 +656,8 @@ impl MusicApp {
                     self.playback_error = Some(e);
                     self.buffering = false;
                     self.seekable = false;
+                    self.recovering = false;
+                    self.persist();
                 }
                 PlaybackEvent::ControlError(e) => self.global_error = Some(e),
             }
@@ -722,7 +771,7 @@ impl MusicApp {
                 }
                 Playback::Stopped | Playback::Error => {
                     if let Some(t) = self.current.clone() {
-                        self.play(t, false);
+                        self.play_from(t, false, self.position);
                     }
                 }
                 _ => {}
@@ -745,6 +794,9 @@ impl MusicApp {
                 let _ = self.player_tx.send(PlayerCommand::Stop);
                 self.playback = Playback::Stopped;
                 self.buffering = false;
+                self.recovering = false;
+                self.position = 0.;
+                self.persist();
             }
             Action::Favorite(track) => {
                 if self.is_favorite(&track.id) {
@@ -969,6 +1021,7 @@ impl eframe::App for MusicApp {
 }
 impl Drop for MusicApp {
     fn drop(&mut self) {
+        self.persist();
         self.search_epoch.fetch_add(1, Ordering::Relaxed);
         self.radio_epoch.fetch_add(1, Ordering::Relaxed);
         self.recommendation_epoch.fetch_add(1, Ordering::Relaxed);
@@ -997,11 +1050,14 @@ mod tests {
         egui::Context,
     ) {
         let ctx = egui::Context::default();
-        let mut app = MusicApp::from_context(&ctx);
+        let mut app = MusicApp::from_library(&ctx, Vec::new(), Session::default(), None);
         app.write_library = false;
         app.favorites.clear();
         app.recent.clear();
         app.queue.clear();
+        app.current = None;
+        app.position = 0.;
+        app.playback = Playback::Empty;
         app.recommendations = Recommendations::default();
         app.rebuild_library();
         let (tx, commands) = mpsc::channel();
@@ -1015,6 +1071,76 @@ mod tests {
         app.player_tx = tx;
         app.player_rx = rx;
         (app, commands, events, ctx)
+    }
+    #[test]
+    fn saved_session_restores_current_track_and_position_without_autoplay() {
+        let ctx = egui::Context::default();
+        let current = track("dQw4w9WgXcQ");
+        let queued = track("hTWKbfoikeg");
+        let saved = Session {
+            current: Some(current.clone()),
+            position: 42.5,
+            volume: 37,
+            queue: vec![queued.clone()],
+            recent: vec![current.clone()],
+        };
+        let restored: Session =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut app = MusicApp::from_library(&ctx, Vec::new(), restored, None);
+        app.write_library = false;
+        assert_eq!(app.current, Some(current));
+        assert_eq!(app.position, 42.5);
+        assert_eq!(app.volume, 37);
+        assert_eq!(app.queue.front(), Some(&queued));
+        assert!(app.playback == Playback::Stopped);
+        assert!(app.player_rx.try_recv().is_err());
+    }
+    #[test]
+    fn recovery_and_manual_retry_preserve_position_without_advancing_queue() {
+        let (mut app, commands, events, ctx) = fixture();
+        let current = track("dQw4w9WgXcQ");
+        app.play(current.clone(), false);
+        commands.recv().unwrap();
+        app.queue.push_back(track("hTWKbfoikeg"));
+        for event in [
+            PlaybackEvent::Ready,
+            PlaybackEvent::Position(42.5),
+            PlaybackEvent::Recovering,
+        ] {
+            events
+                .send(PlayerEvent {
+                    generation: app.generation,
+                    event,
+                })
+                .unwrap();
+        }
+        app.receive();
+        assert!(app.recovering && app.playback == Playback::Loading);
+        assert_eq!(app.position, 42.5);
+        assert_eq!(app.queue.len(), 1);
+        events
+            .send(PlayerEvent {
+                generation: app.generation,
+                event: PlaybackEvent::Error("offline".into()),
+            })
+            .unwrap();
+        app.receive();
+        app.dispatch(Action::TogglePlayback, &ctx);
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::Play { track, position: 42.5, .. } if track == current)
+        );
+        assert_eq!(app.queue.len(), 1);
+        // A restored session waits for Play and uses the same resume path.
+        app.playback = Playback::Stopped;
+        app.position = 19.;
+        app.dispatch(Action::TogglePlayback, &ctx);
+        assert!(matches!(
+            commands.recv().unwrap(),
+            PlayerCommand::Play { position: 19., .. }
+        ));
+        app.dispatch(Action::Stop, &ctx);
+        assert_eq!(app.position, 0.);
+        assert!(!app.recovering);
     }
     #[test]
     fn recommendations_filter_known_tracks_and_duplicates_and_bound_results() {
