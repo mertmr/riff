@@ -250,6 +250,7 @@ pub fn search(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                         liked: app.favorites.iter().any(|t| t.id == track.id),
                         selected: app.selected == Some(i),
                         queue: false,
+                        collection: false,
                         radio: false,
                         queue_range: 0..0,
                         saved: app.saved_tracks.iter().any(|t| t.id == track.id),
@@ -315,12 +316,27 @@ pub fn library(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                         {
                             ui.painter().rect_filled(rect, 8, HOVER);
                         }
-                        widgets::placeholder(
-                            ui,
-                            Rect::from_min_size(rect.min + vec2(8., 8.), vec2(48., 48.)),
-                            6,
-                            Icon::Library,
+                        let shell = rect.shrink2(vec2(0., 3.));
+                        widgets::gradient(ui.painter(), shell, 10., SURFACE, BG);
+                        ui.painter().rect_stroke(
+                            shell,
+                            10,
+                            Stroke::new(1., LINE),
+                            egui::StrokeKind::Inside,
                         );
+                        let cover = Rect::from_min_size(rect.min + vec2(8., 8.), vec2(48., 48.));
+                        if let Some(track) = playlist.tracks.first() {
+                            app.artwork.paint(ui, track, cover, 6);
+                        } else {
+                            widgets::placeholder(ui, cover, 6, Icon::Library);
+                        }
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                format!("Open playlist {}", playlist.title),
+                            )
+                        });
                         widgets::text(
                             ui,
                             Rect::from_min_max(
@@ -394,15 +410,98 @@ pub fn library(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
         if entries.is_empty() && ui.button("Find music to save").clicked() {
             actions.push(Action::FocusSearch);
         }
+        let columns = ((ui.available_width() + 16.) / 184.).floor().max(1.) as usize;
+        let width = (ui.available_width() - (columns - 1) as f32 * 16.) / columns as f32;
         egui::ScrollArea::vertical()
             .id_salt(title)
             .auto_shrink([false, false])
-            .show_rows(ui, 64., entries.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.;
-                for i in range {
-                    collection_row(ui, &mut app.artwork, entries[i], actions);
-                }
-            });
+            .show_rows(
+                ui,
+                width + 78.,
+                entries.len().div_ceil(columns),
+                |ui, range| {
+                    for row in range {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 16.;
+                            for collection in entries.iter().skip(row * columns).take(columns) {
+                                let fallback = app
+                                    .albums
+                                    .iter()
+                                    .find(|a| a.collection.id == collection.id)
+                                    .and_then(|a| a.tracks.first());
+                                ui.push_id(&collection.id, |ui| {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        vec2(width, width + 70.),
+                                        Sense::hover(),
+                                    );
+                                    let response = ui.interact(
+                                        r,
+                                        ui.id().with("collection_card"),
+                                        Sense::click(),
+                                    );
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            format!(
+                                                "Open {} {}",
+                                                collection.kind.label(),
+                                                collection.title
+                                            ),
+                                        )
+                                    });
+                                    if response.hovered() || response.has_focus() {
+                                        ui.painter().rect_filled(r, 12, SURFACE);
+                                    }
+                                    let cover = Rect::from_min_size(r.min, vec2(width, width));
+                                    let radius = if collection.kind == CollectionKind::Artist {
+                                        (width / 2.).min(255.) as u8
+                                    } else {
+                                        10
+                                    };
+                                    if let Some(url) = &collection.thumbnail {
+                                        app.artwork.paint_url(
+                                            ui,
+                                            &collection.id,
+                                            url,
+                                            cover,
+                                            radius,
+                                        );
+                                    } else if let Some(track) = fallback {
+                                        app.artwork.paint(ui, track, cover, radius);
+                                    } else {
+                                        widgets::placeholder(ui, cover, radius, Icon::Music);
+                                    }
+                                    widgets::text(
+                                        ui,
+                                        Rect::from_min_size(
+                                            r.min + vec2(4., width + 10.),
+                                            vec2(width - 8., 24.),
+                                        ),
+                                        &collection.title,
+                                        14.,
+                                        TEXT,
+                                    );
+                                    widgets::text(
+                                        ui,
+                                        Rect::from_min_size(
+                                            r.min + vec2(4., width + 36.),
+                                            vec2(width - 8., 22.),
+                                        ),
+                                        &collection.subtitle,
+                                        12.,
+                                        MUTED,
+                                    );
+                                    if response.clicked() {
+                                        actions.push(Action::OpenCollection((*collection).clone()));
+                                    }
+                                    response.on_hover_text(&collection.title);
+                                });
+                            }
+                        });
+                    }
+                },
+            );
     }
 }
 
@@ -422,25 +521,83 @@ pub fn detail(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
         .collection
         .as_ref()
         .map_or("Your playlist", |c| c.subtitle.as_str());
-    if ui.available_height() < 400. {
-        ui.add(egui::Label::new(RichText::new(title).font(bold(24.))).truncate());
-        ui.add(egui::Label::new(RichText::new(subtitle).size(12.).color(MUTED)).truncate());
+    let source = playlist.map_or(&app.detail.tracks, |p| &p.tracks);
+    let height = if ui.available_height() < 400. {
+        104.
     } else {
-        widgets::heading(ui, title, subtitle);
+        152.
+    };
+    let (hero, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    widgets::gradient(ui.painter(), hero, 12., ACTIVE, SURFACE);
+    ui.painter()
+        .rect_stroke(hero, 12, Stroke::new(1., LINE), egui::StrokeKind::Inside);
+    let cover = Rect::from_min_size(hero.min + vec2(16., 16.), vec2(height - 32., height - 32.));
+    if let Some(collection) = &app.collection
+        && let Some(url) = &collection.thumbnail
+    {
+        app.artwork.paint_url(
+            ui,
+            &collection.id,
+            url,
+            cover,
+            if collection.kind == CollectionKind::Artist {
+                60
+            } else {
+                8
+            },
+        );
+    } else if let Some(track) = source.first() {
+        app.artwork.paint(ui, track, cover, 8);
+    } else {
+        widgets::placeholder(ui, cover, 8, Icon::Library);
+    }
+    let text_x = cover.right() + 20.;
+    let width = hero.right() - text_x - 16.;
+    let kind = app
+        .collection
+        .as_ref()
+        .map_or("PLAYLIST".to_owned(), |c| c.kind.label().to_uppercase());
+    widgets::text(
+        ui,
+        Rect::from_min_size(pos2(text_x, hero.top() + 18.), vec2(width, 20.)),
+        &kind,
+        10.,
+        MUTED,
+    );
+    widgets::text(
+        ui,
+        Rect::from_min_size(pos2(text_x, hero.top() + 40.), vec2(width, 34.)),
+        title,
+        if height < 120. { 24. } else { 30. },
+        TEXT,
+    );
+    if height > 120. {
+        widgets::text(
+            ui,
+            Rect::from_min_size(pos2(text_x, hero.top() + 82.), vec2(width, 22.)),
+            subtitle,
+            12.,
+            MUTED,
+        );
+        widgets::text(
+            ui,
+            Rect::from_min_size(pos2(text_x, hero.top() + 112.), vec2(width, 20.)),
+            &format!("{} songs", source.len()),
+            11.,
+            DIM,
+        );
     }
     ui.add_space(16.);
-    let source = playlist.map_or(&app.detail.tracks, |p| &p.tracks);
     let saved = app
         .collection
         .as_ref()
         .is_some_and(|c| app.collection_saved(c));
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .add_enabled(!source.is_empty(), egui::Button::new("Play all"))
-            .clicked()
-        {
-            actions.push(Action::PlayTracks(source.clone()));
-        }
+        ui.add_enabled_ui(!source.is_empty(), |ui| {
+            if widgets::button(ui, "Play all", true).clicked() {
+                actions.push(Action::PlayTracks(source.clone()));
+            }
+        });
         if ui
             .add_enabled(!source.is_empty(), egui::Button::new("Add all to queue"))
             .clicked()
@@ -582,6 +739,7 @@ pub fn detail(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                         liked: app.favorites.iter().any(|t| t.id == track.id),
                         selected: app.selected == Some(i),
                         queue: false,
+                        collection: true,
                         radio: false,
                         queue_range: 0..source.len(),
                         saved: app.saved_tracks.iter().any(|t| t.id == track.id),
@@ -623,8 +781,10 @@ pub fn editor(app: &mut MusicApp, ctx: &egui::Context, actions: &mut Vec<Action>
                     field.request_focus();
                 }
                 let submit = ui
-                    .add_enabled(!title.trim().is_empty(), egui::Button::new("Save"))
-                    .clicked()
+                    .add_enabled_ui(!title.trim().is_empty(), |ui| {
+                        widgets::button(ui, "Save", true).clicked()
+                    })
+                    .inner
                     || (!title.trim().is_empty() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if submit {
                     actions.push(match &editor {

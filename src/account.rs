@@ -26,6 +26,7 @@ const SCOPES: &str = "openid profile https://www.googleapis.com/auth/youtube.rea
 #[derive(Clone, Default)]
 pub struct Library {
     pub name: String,
+    pub picture: Option<String>,
     pub likes: Vec<Track>,
     pub subscriptions: Vec<Collection>,
     pub playlists: Vec<Collection>,
@@ -610,6 +611,7 @@ impl Client {
                 .as_str()
                 .unwrap_or("Google account")
                 .to_owned(),
+            picture: profile["picture"].as_str().map(str::to_owned),
             likes: unique_tracks(likes),
             subscriptions,
             playlists,

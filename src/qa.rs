@@ -175,6 +175,7 @@ pub fn configure(app: &mut MusicApp) {
                 };
                 app.account.library = Some(crate::account::Library {
                     name: "Riff listener".into(),
+                    picture: None,
                     likes: app.results.clone(),
                     subscriptions: app.artists.clone(),
                     playlists: vec![playlist.clone()],
@@ -188,6 +189,10 @@ pub fn configure(app: &mut MusicApp) {
         Ok("home-loading") => {
             app.recommendations.tracks.clear();
             app.recommendations.searching = true;
+        }
+        Ok("home-refreshing") => app.recommendations.searching = true,
+        Ok("home-refresh-error") => {
+            app.recommendations.error = Some("Check your connection and try again.".into())
         }
         Ok("home-error") => {
             app.recommendations.tracks.clear();

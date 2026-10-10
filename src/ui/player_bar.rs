@@ -4,21 +4,26 @@ use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     egui::Panel::bottom("playback_bar")
-        .exact_size(112.)
+        .exact_size(106.)
         .resizable(false)
         .show_separator_line(false)
         .frame(
             egui::Frame::new()
-                .fill(SIDEBAR)
-                .inner_margin(egui::Margin::symmetric(24, 0)),
+                .fill(BG)
+                .inner_margin(egui::Margin::symmetric(24, 10)),
         )
         .show(ui, |ui| {
             let r = ui.max_rect();
-            ui.painter().hline(
-                r.expand2(vec2(24., 0.)).x_range(),
-                r.top(),
-                Stroke::new(1., LINE),
+            let shell = r.expand2(vec2(12., 2.));
+            widgets::gradient(
+                ui.painter(),
+                shell,
+                14.,
+                SIDEBAR,
+                egui::Color32::from_rgb(17, 18, 28),
             );
+            ui.painter()
+                .rect_stroke(shell, 14, Stroke::new(1., LINE), egui::StrokeKind::Inside);
             let left = (r.width() * 0.29).clamp(240., 368.);
             let right = if r.width() < 1050. { 184. } else { 224. };
             let left_rect = Rect::from_min_size(r.min, vec2(left, r.height()));
@@ -143,10 +148,10 @@ fn now_playing(app: &mut MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Actio
     }
 }
 fn transport(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
-    let cy = r.top() + 38.;
+    let cy = r.top() + 36.;
     let cx = r.center().x;
     let previous = Rect::from_center_size(pos2(cx - 56., cy), vec2(40., 40.));
-    let play = Rect::from_center_size(pos2(cx, cy), vec2(40., 40.));
+    let play = Rect::from_center_size(pos2(cx, cy), vec2(46., 46.));
     let next = Rect::from_center_size(pos2(cx + 56., cy), vec2(40., 40.));
     if widgets::icon_button(
         ui,
@@ -191,7 +196,7 @@ fn transport(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
         Icon::Next,
         "Next track",
         false,
-        app.queue_len() > 0 || app.radio.is_some(),
+        app.can_next(),
         false,
     )
     .clicked()
@@ -200,14 +205,19 @@ fn transport(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
     }
     let progress_width = r.width().min(560.);
     let progress = Rect::from_center_size(
-        pos2(cx, r.top() + 84.),
+        pos2(cx, r.top() + 72.),
         vec2((progress_width - 88.).max(64.), 24.),
     );
     let duration = app.effective_duration();
-    let enabled = duration.is_some()
+    let enabled = app.current.is_some()
+        && duration.is_some()
         && matches!(
             app.playback,
-            Playback::Playing | Playback::Paused | Playback::Loading
+            Playback::Playing
+                | Playback::Paused
+                | Playback::Loading
+                | Playback::Stopped
+                | Playback::Error
         );
     if let Some(value) = widgets::slider(
         ui,
@@ -257,7 +267,7 @@ fn extras(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
         ui.painter()
             .circle_filled(pos2(q.center().x, q.bottom() + 4.), 2., ACCENT);
     }
-    let radio = Rect::from_center_size(pos2(q.center().x, y - 36.), vec2(28., 28.));
+    let radio = Rect::from_center_size(pos2(q.center().x, y - 32.), vec2(24., 24.));
     if widgets::icon_button(
         ui,
         "player_radio",
@@ -318,7 +328,7 @@ fn extras(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
     }
     widgets::text(
         ui,
-        Rect::from_center_size(pos2(volume.center().x, y + 28.), vec2(72., 16.)),
+        Rect::from_center_size(pos2(volume.center().x, y + 24.), vec2(72., 16.)),
         &format!("{}%", next_volume.map_or(app.volume, |v| v as u8)),
         10.,
         DIM,

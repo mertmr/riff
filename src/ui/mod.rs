@@ -1,5 +1,6 @@
 mod account;
 mod artwork;
+mod carousel;
 mod collections;
 pub mod icons;
 mod player_bar;
@@ -20,9 +21,9 @@ pub fn show(app: &mut MusicApp, ui: &mut egui::Ui) {
         .exact_size(if compact {
             80.
         } else if width < 1150. {
-            192.
+            200.
         } else {
-            216.
+            232.
         })
         .resizable(false)
         .show_separator_line(false)
@@ -31,10 +32,23 @@ pub fn show(app: &mut MusicApp, ui: &mut egui::Ui) {
     if app.queue_open {
         queue::show(app, ui, &mut actions);
     }
-    let padding = if ui.available_width() < 750. { 24 } else { 32 };
+    let padding = if ui.available_width() < 750. { 20 } else { 24 };
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(BG).inner_margin(padding))
+        .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin {
+            left: padding,
+            right: padding,
+            top: 10,
+            bottom: padding,
+        }))
         .show(ui, |ui| {
+            let background = ui.max_rect().expand(padding as f32);
+            widgets::gradient(
+                ui.painter(),
+                background,
+                0.,
+                BG,
+                egui::Color32::from_rgb(19, 11, 24),
+            );
             screens::topbar(app, ui, &mut actions);
             ui.add_space(24.);
             if let Some(error) = &app.global_error {

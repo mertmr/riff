@@ -1,16 +1,15 @@
 use eframe::egui::{self, Color32, FontData, FontFamily, FontId, Stroke, TextStyle};
 
-// YouTube-inspired dark palette. Keep surfaces neutral and reserve red for accents.
-pub const BG: Color32 = Color32::from_rgb(15, 15, 15);
-pub const SIDEBAR: Color32 = BG;
-pub const SURFACE: Color32 = Color32::from_rgb(33, 33, 33);
-pub const HOVER: Color32 = Color32::from_rgb(48, 48, 48);
-pub const ACTIVE: Color32 = HOVER;
-pub const ACCENT: Color32 = Color32::from_rgb(255, 0, 51);
-pub const TEXT: Color32 = Color32::WHITE;
-pub const MUTED: Color32 = Color32::from_rgb(170, 170, 170);
-pub const DIM: Color32 = Color32::from_rgb(128, 128, 128);
-pub const LINE: Color32 = Color32::from_rgb(63, 63, 63);
+pub const BG: Color32 = Color32::from_rgb(8, 11, 18);
+pub const SIDEBAR: Color32 = Color32::from_rgb(12, 15, 23);
+pub const SURFACE: Color32 = Color32::from_rgb(24, 26, 37);
+pub const HOVER: Color32 = Color32::from_rgb(35, 36, 49);
+pub const ACTIVE: Color32 = Color32::from_rgb(49, 24, 40);
+pub const ACCENT: Color32 = Color32::from_rgb(255, 32, 76);
+pub const TEXT: Color32 = Color32::from_rgb(247, 247, 252);
+pub const MUTED: Color32 = Color32::from_rgb(177, 181, 198);
+pub const DIM: Color32 = Color32::from_rgb(120, 127, 149);
+pub const LINE: Color32 = Color32::from_rgb(48, 51, 67);
 pub const ERROR: Color32 = Color32::from_rgb(255, 153, 170);
 
 pub fn install(ctx: &egui::Context) {
@@ -41,7 +40,8 @@ pub fn install(ctx: &egui::Context) {
     v.override_text_color = Some(TEXT);
     v.selection.bg_fill = ACTIVE;
     v.selection.stroke = Stroke::new(1.0, ACCENT);
-    v.window_corner_radius = 12.into();
+    v.window_corner_radius = 16.into();
+    v.hyperlink_color = ACCENT;
     v.window_stroke = Stroke::new(1.0, LINE);
     for widget in [
         &mut v.widgets.noninteractive,
@@ -51,7 +51,7 @@ pub fn install(ctx: &egui::Context) {
         &mut v.widgets.open,
     ] {
         widget.corner_radius = 8.into();
-        widget.bg_stroke = Stroke::NONE;
+        widget.bg_stroke = Stroke::new(1.0, LINE);
         widget.weak_bg_fill = SURFACE;
         widget.fg_stroke = Stroke::new(1.5, TEXT);
     }
@@ -64,6 +64,7 @@ pub fn install(ctx: &egui::Context) {
         s.spacing.button_padding = egui::vec2(16.0, 10.0);
         s.spacing.interact_size = egui::vec2(40.0, 40.0);
         s.animation_time = 0.14;
+        s.spacing.scroll.bar_width = 4.0;
         s.text_styles
             .insert(TextStyle::Body, FontId::proportional(14.0));
         s.text_styles

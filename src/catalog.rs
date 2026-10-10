@@ -81,7 +81,15 @@ impl Client {
                 .into(),
         }
     }
-    fn request(&self, endpoint: &str, mut body: Value) -> Result<Value, String> {
+    fn request(&self, endpoint: &str, body: Value) -> Result<Value, String> {
+        self.request_with_timeout(endpoint, body, Duration::from_secs(20))
+    }
+    fn request_with_timeout(
+        &self,
+        endpoint: &str,
+        mut body: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         body["context"] = json!({"client": {"clientName": "WEB_REMIX",
             "clientVersion": "1.20240918.01.00", "hl": "en", "gl": "US"}});
         let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
@@ -91,6 +99,9 @@ impl Client {
             .header("Content-Type", "application/json")
             .header("Origin", "https://music.youtube.com")
             .header("User-Agent", "Mozilla/5.0")
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
             .send(bytes.as_slice())
             .map_err(|e| format!("Couldn't load YouTube Music: {e}"))?;
         let bytes = response
@@ -116,6 +127,22 @@ impl Client {
             return Err("YouTube Music returned no catalog data. Try again.".into());
         }
         Ok(value)
+    }
+    pub fn recommendations(&self, id: &str) -> Result<Vec<Track>, String> {
+        if !is_valid_video_id(id) {
+            return Err("Cannot find recommendations for an invalid track.".into());
+        }
+        // One watch-list page supplies enough candidates; never follow mix continuations.
+        let body = json!({
+            "videoId": id,
+            "playlistId": format!("RDAMVM{id}"),
+            "enablePersistentPlaylistPanel": true,
+            "isAudioOnly": true,
+            "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+            "params": "wAEB",
+        });
+        self.request_with_timeout("next", body, Duration::from_secs(8))
+            .and_then(|value| parse_recommendations(&value))
     }
     pub fn search(
         &self,
@@ -302,20 +329,45 @@ fn parse_row(row: &Value, page: &mut Page) {
         artist: "Unknown artist".into(),
         ..Default::default()
     };
-    for column in columns
-        .iter()
-        .skip(1)
-        .chain(std::iter::once(&&row["subtitle"]))
-    {
+    track_metadata(
+        &mut track,
+        columns
+            .iter()
+            .skip(1)
+            .copied()
+            .chain(std::iter::once(&row["subtitle"])),
+    );
+    if let Some(columns) = row["fixedColumns"].as_array() {
+        track.duration_seconds = columns
+            .iter()
+            .find_map(|c| {
+                duration(&text(
+                    &c["musicResponsiveListItemFixedColumnRenderer"]["text"],
+                ))
+            })
+            .or(track.duration_seconds);
+    }
+    page.tracks.push(track);
+}
+
+fn track_metadata<'a>(track: &mut Track, columns: impl IntoIterator<Item = &'a Value>) {
+    let mut channel = None;
+    for column in columns {
         if let Some(runs) = column["runs"].as_array() {
             let mut artists = Vec::new();
             for run in runs {
                 if let Some((id, kind)) = browse(&run["navigationEndpoint"]) {
-                    if kind == "MUSIC_PAGE_TYPE_ARTIST" {
-                        artists.push(run["text"].as_str().unwrap_or_default());
+                    let name = run["text"].as_str().unwrap_or_default().trim();
+                    if kind == "MUSIC_PAGE_TYPE_ARTIST" && !name.is_empty() {
+                        artists.push(name);
                         if track.artist_id.is_none() {
                             track.artist_id = Some(id.into());
                         }
+                    } else if !name.is_empty()
+                        && (kind == "MUSIC_PAGE_TYPE_USER_CHANNEL"
+                            || (kind.is_empty() && id.starts_with("UC")))
+                    {
+                        channel.get_or_insert((name, id));
                     } else if kind == "MUSIC_PAGE_TYPE_ALBUM" {
                         track.album = run["text"].as_str().map(str::to_owned);
                         track.album_id = Some(id.into());
@@ -330,17 +382,59 @@ fn parse_row(row: &Value, page: &mut Page) {
             }
         }
     }
-    if let Some(columns) = row["fixedColumns"].as_array() {
-        track.duration_seconds = columns
-            .iter()
-            .find_map(|c| {
-                duration(&text(
-                    &c["musicResponsiveListItemFixedColumnRenderer"]["text"],
-                ))
-            })
-            .or(track.duration_seconds);
+    if track.artist == "Unknown artist"
+        && let Some((name, id)) = channel
+    {
+        track.artist = name.into();
+        track.artist_id = Some(id.into());
     }
-    page.tracks.push(track);
+}
+
+fn parse_recommendations(value: &Value) -> Result<Vec<Track>, String> {
+    let contents = find_renderer(value, "playlistPanelRenderer")
+        .and_then(|panel| panel["contents"].as_array())
+        .ok_or("YouTube Music returned no recommendations. Try again.")?;
+    let mut seen = HashSet::new();
+    let tracks: Vec<_> = contents
+        .iter()
+        .filter_map(|entry| {
+            let entry = entry
+                .pointer("/playlistPanelVideoWrapperRenderer/primaryRenderer")
+                .unwrap_or(entry);
+            let row = entry.get("playlistPanelVideoRenderer")?;
+            if row.get("unplayableText").is_some()
+                || row["musicItemRendererDisplayPolicy"].as_str()
+                    == Some("MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT")
+            {
+                return None;
+            }
+            let id = row["videoId"].as_str().filter(|id| is_valid_video_id(id))?;
+            let title = text(&row["title"]);
+            if title.trim().is_empty() || !seen.insert(id) {
+                return None;
+            }
+            let mut track = Track {
+                id: id.into(),
+                title,
+                artist: "Unknown artist".into(),
+                duration_seconds: duration(&text(&row["lengthText"])),
+                ..Default::default()
+            };
+            track_metadata(&mut track, std::iter::once(&row["longBylineText"]));
+            if track.artist == "Unknown artist" {
+                let byline = text(&row["shortBylineText"]);
+                if !byline.trim().is_empty() {
+                    track.artist = byline;
+                }
+            }
+            Some(track)
+        })
+        .take(50)
+        .collect();
+    if tracks.is_empty() {
+        return Err("YouTube Music returned no playable recommendations. Try again.".into());
+    }
+    Ok(tracks)
 }
 
 fn find_renderer<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
@@ -466,6 +560,90 @@ fn parse_contents(value: &Value, unique_tracks: bool) -> Page {
 mod tests {
     use super::*;
     #[test]
+    fn watch_recommendations_preserve_metadata_skip_unplayable_and_ignore_counterparts() {
+        let primary = json!({
+            "videoId": "dQw4w9WgXcQ",
+            "title": {"runs": [{"text": "Song"}]},
+            "lengthText": {"runs": [{"text": "3:33"}]},
+            "longBylineText": {"runs": [
+                {"text": "Artist", "navigationEndpoint": {"browseEndpoint": {
+                    "browseId": "UCartist", "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}
+                    }
+                }}},
+                {"text": "Album", "navigationEndpoint": {"browseEndpoint": {
+                    "browseId": "MPREalbum", "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ALBUM"}
+                    }
+                }}}
+            ]}
+        });
+        let counterpart = json!({"videoId": "hTWKbfoikeg", "title": {"simpleText": "Other video"}});
+        let response = json!({"contents": {"playlistPanelRenderer": {"contents": [
+            {"playlistPanelVideoWrapperRenderer": {
+                "primaryRenderer": {"playlistPanelVideoRenderer": primary},
+                "counterpart": [{"counterpartRenderer": {"playlistPanelVideoRenderer": counterpart}}]
+            }},
+            {"playlistPanelVideoRenderer": primary},
+            {"playlistPanelVideoRenderer": {"videoId": "4NRXx6U8ABQ", "title": {"simpleText": "Video"}, "shortBylineText": {"runs": [{"text": "Uploader"}]}}},
+            {"playlistPanelVideoRenderer": {"videoId": "hTWKbfoikeg", "title": {"simpleText": "Unavailable"}, "unplayableText": {"simpleText": "Unavailable"}}},
+            {"playlistPanelVideoRenderer": {"videoId": "JGwWNGJdvx8", "title": {"simpleText": "Blocked"}, "musicItemRendererDisplayPolicy": "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT"}},
+            {"playlistPanelVideoRenderer": {"videoId": "invalid", "title": {"simpleText": "Invalid"}}},
+            {"playlistPanelVideoRenderer": {"videoId": "RgKAFK5djSk", "title": {"simpleText": " "}}},
+            {"automixPreviewVideoRenderer": {"playlistPanelVideoRenderer": counterpart}}
+        ]}}});
+        let tracks = parse_recommendations(&response).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, "dQw4w9WgXcQ");
+        assert_eq!(tracks[0].duration_seconds, Some(213));
+        assert_eq!(tracks[0].artist, "Artist");
+        assert_eq!(tracks[0].artist_id.as_deref(), Some("UCartist"));
+        assert_eq!(tracks[0].album.as_deref(), Some("Album"));
+        assert_eq!(tracks[0].album_id.as_deref(), Some("MPREalbum"));
+        assert_eq!(tracks[1].artist, "Uploader");
+        assert!(parse_recommendations(&json!({})).is_err());
+        assert!(
+            parse_recommendations(&json!({"playlistPanelRenderer": {"contents": []}})).is_err()
+        );
+        assert!(
+            Client::new()
+                .recommendations("invalid")
+                .unwrap_err()
+                .contains("invalid track")
+        );
+    }
+    #[test]
+    fn watch_recommendations_are_bounded_to_one_page() {
+        let contents: Vec<_> = (0..60)
+            .map(|id| {
+                json!({"playlistPanelVideoRenderer": {
+                    "videoId": format!("{id:011}"), "title": {"simpleText": "Song"}
+                }})
+            })
+            .collect();
+        let tracks =
+            parse_recommendations(&json!({"playlistPanelRenderer": {"contents": contents}}))
+                .unwrap();
+        assert_eq!(tracks.len(), 50);
+    }
+    #[test]
+    #[ignore = "requires live YouTube Music access"]
+    fn live_recommendations_single_page() {
+        let start = std::time::Instant::now();
+        let tracks = Client::new().recommendations("4NRXx6U8ABQ").unwrap();
+        eprintln!(
+            "Loaded {} recommendation candidates in {:?}",
+            tracks.len(),
+            start.elapsed()
+        );
+        assert!(tracks.len() > 1 && tracks.len() <= 50);
+        assert!(
+            tracks
+                .iter()
+                .any(|track| track.id != "4NRXx6U8ABQ" && track.artist != "Unknown artist")
+        );
+    }
+    #[test]
     fn parses_typed_results_metadata_and_continuations() {
         let response = json!({"contents": [
             {"musicResponsiveListItemRenderer": {"playlistItemData":{"videoId":"dQw4w9WgXcQ"}, "flexColumns":[
@@ -480,6 +658,83 @@ mod tests {
         assert_eq!(page.collections[0].kind, CollectionKind::Album);
         assert_eq!(page.continuation.as_deref(), Some("more"));
     }
+    #[test]
+    fn video_results_use_the_uploader_channel_for_the_artist() {
+        // Video uploads use USER_CHANNEL rather than an artist page, and some
+        // catalog rows omit the page type entirely.
+        for kind in [Some("MUSIC_PAGE_TYPE_USER_CHANNEL"), None] {
+            let mut channel = json!({"text": " Timeless Pop Music ", "navigationEndpoint": {
+                "browseEndpoint": {"browseId": "UC_hkrook3LFBIA0kfpDwrgg"}
+            }});
+            if let Some(kind) = kind {
+                channel["navigationEndpoint"]["browseEndpoint"]["browseEndpointContextSupportedConfigs"] = json!({
+                    "browseEndpointContextMusicConfig": {"pageType": kind}
+                });
+            }
+            let title = json!({"runs": [{"text": "Top Hits 2026", "navigationEndpoint": {
+                "watchEndpoint": {"videoId": "Wjeb9ybZfN8"}
+            }}]});
+            let subtitle = json!({"runs": [
+                {"text": "Video"}, {"text": " • "}, channel,
+                {"text": " • "}, {"text": "30K views"}
+            ]});
+            let response = json!({"contents": [
+                {"musicResponsiveListItemRenderer": {
+                    "playlistItemData": {"videoId": "Wjeb9ybZfN8"},
+                    "flexColumns": [
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": title}},
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": subtitle}}
+                    ]
+                }},
+                {"musicTwoRowItemRenderer": {"title": title, "subtitle": subtitle}}
+            ]});
+            let page = parse_contents(&response, false);
+            assert_eq!(page.tracks.len(), 2);
+            for track in page.tracks {
+                assert_eq!(track.artist, "Timeless Pop Music");
+                assert_eq!(track.artist_id.as_deref(), Some("UC_hkrook3LFBIA0kfpDwrgg"));
+                assert!(track.duration_seconds.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn uploader_fallback_keeps_artist_metadata_and_ignores_other_links() {
+        let run = |name, id, kind| {
+            json!({"text": name, "navigationEndpoint": {
+                "browseEndpoint": {"browseId": id, "browseEndpointContextSupportedConfigs": {
+                    "browseEndpointContextMusicConfig": {"pageType": kind}
+                }}
+            }})
+        };
+        let artist = run("Artist", "UCartist", "MUSIC_PAGE_TYPE_ARTIST");
+        let channel = run("Uploader", "UCchannel", "MUSIC_PAGE_TYPE_USER_CHANNEL");
+        let album = run("Album", "MPREalbum", "MUSIC_PAGE_TYPE_ALBUM");
+        let playlist = run("Playlist", "VLplaylist", "MUSIC_PAGE_TYPE_PLAYLIST");
+        let blank = run("  ", "UCblank", "MUSIC_PAGE_TYPE_USER_CHANNEL");
+        for runs in [
+            json!([channel, artist, album]),
+            json!([album, playlist, blank]),
+        ] {
+            let response = json!({"musicTwoRowItemRenderer": {
+                "title": {"runs": [{"text": "Song", "navigationEndpoint": {
+                    "watchEndpoint": {"videoId": "dQw4w9WgXcQ"}
+                }}]},
+                "subtitle": {"runs": runs}
+            }});
+            let page = parse_page(&response);
+            let track = &page.tracks[0];
+            assert_eq!(track.album.as_deref(), Some("Album"));
+            if runs.as_array().unwrap().contains(&artist) {
+                assert_eq!(track.artist, "Artist");
+                assert_eq!(track.artist_id.as_deref(), Some("UCartist"));
+            } else {
+                assert_eq!(track.artist, "Unknown artist");
+                assert!(track.artist_id.is_none());
+            }
+        }
+    }
+
     #[test]
     fn card_shelf_songs_inherit_the_card_artist() {
         let response = json!({"contents": [

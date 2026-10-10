@@ -11,10 +11,10 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
         .exact_size(320.)
         .resizable(false)
         .show_separator_line(false)
-        .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(20))
+        .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(16))
         .show(ui, |ui| {
             ui.painter().vline(
-                ui.max_rect().left() - 20.,
+                ui.max_rect().left() - 16.,
                 ui.max_rect().y_range(),
                 Stroke::new(1., LINE),
             );
@@ -210,6 +210,7 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                                     liked: app.favorites.iter().any(|t| t.id == track.id),
                                     selected: app.queue_selected == Some(i),
                                     queue: true,
+                                    collection: false,
                                     radio: i >= app.queue.len(),
                                     queue_range,
                                     saved: app.saved_tracks.iter().any(|t| t.id == track.id),

@@ -31,12 +31,18 @@ fn main() -> eframe::Result {
             ..Default::default()
         }
     };
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("Riff")
+        .with_icon(icon)
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([960.0, 600.0]);
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_title_shown(false)
+        .with_titlebar_shown(false);
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Riff")
-            .with_icon(icon)
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([960.0, 600.0]),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         // One queued frame is sufficient for this 2D UI and avoids another
         // full Retina surface being kept in flight.

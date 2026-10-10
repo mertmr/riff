@@ -55,11 +55,10 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.label(RichText::new("Riff uses these likes for recommendations. Your Google password stays in your browser.").color(MUTED));
         ui.add_space(12.);
         if ui
-            .add_enabled(
-                !app.account.loading,
-                egui::Button::new("Sign in with Google"),
-            )
-            .clicked()
+            .add_enabled_ui(!app.account.loading, |ui| {
+                widgets::button(ui, "Sign in with Google", true).clicked()
+            })
+            .inner
         {
             actions.push(Action::ConnectAccount);
         }
@@ -246,6 +245,7 @@ fn rows(
                         liked: favorites.iter().any(|t| t.id == track.id),
                         selected: selected == Some(index),
                         queue: false,
+                        collection: false,
                         radio: false,
                         queue_range: 0..0,
                         saved: saved.iter().any(|t| t.id == track.id),
