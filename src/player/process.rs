@@ -6,7 +6,7 @@ use std::{
 
 // Playback and extraction may spawn helpers of their own. Cancellation must
 // reap the whole owned process tree, not leave a Python/JS extractor running.
-pub(super) struct ChildProcess {
+pub(crate) struct ChildProcess {
     child: Child,
     group_stopped: bool,
     #[cfg(windows)]

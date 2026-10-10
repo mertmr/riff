@@ -1,5 +1,5 @@
 //! mpv lives on a worker; its JSON IPC observations are the source of playback truth.
-use crate::model::Track;
+use crate::{audio_cache::AudioCache, model::Track};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
@@ -9,7 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-mod process;
+pub(crate) mod process;
 mod resolver;
 use process::ChildProcess as Child;
 use resolver::{Media, Resolver};
@@ -18,6 +18,8 @@ pub enum PlayerCommand {
     Play {
         track: Track,
         generation: u64,
+        position: f64,
+        paused: bool,
     },
     PrepareNext {
         track: Option<Track>,
@@ -164,6 +166,9 @@ impl Connection {
                     )
                 };
                 if ok == 0 {
+                    if self.pending.contains(&b'\n') {
+                        break;
+                    }
                     return Err(std::io::Error::last_os_error());
                 }
                 if available == 0 {
@@ -171,6 +176,7 @@ impl Connection {
                 }
             }
             match self.stream.read(&mut buf) {
+                Ok(0) if self.pending.contains(&b'\n') => break,
                 Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
                 Ok(n) => self.pending.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -254,12 +260,15 @@ struct Playing {
     buffering_since: Option<Instant>,
     buffering: bool,
     retry_at: Option<Instant>,
+    cached: bool,
+    cache_started: bool,
 }
 struct Upcoming {
     binding: Binding,
     media: Option<Media>,
     entry: Option<i64>,
     attempted: bool,
+    cached: bool,
 }
 struct Handoff {
     previous: Playing,
@@ -274,6 +283,7 @@ struct Engine<W: Fn()> {
     next: Option<Upcoming>,
     handoff: Option<Handoff>,
     resolver: Option<Resolver>,
+    cache: AudioCache,
     bindings: HashMap<i64, Binding>,
     requests: HashMap<u64, Binding>,
     messages: VecDeque<Value>,
@@ -302,6 +312,7 @@ impl<W: Fn()> Engine<W> {
             next: None,
             handoff: None,
             resolver: None,
+            cache: AudioCache::new(),
             bindings: HashMap::new(),
             requests: HashMap::new(),
             messages: VecDeque::new(),
@@ -439,6 +450,7 @@ impl<W: Fn()> Engine<W> {
             media: None,
             entry: None,
             attempted: false,
+            cached: false,
         });
         self.current = Some(previous);
         true
@@ -473,7 +485,18 @@ impl<W: Fn()> Engine<W> {
     }
     fn handle(&mut self, command: PlayerCommand) -> bool {
         match command {
-            PlayerCommand::Play { track, generation } => {
+            PlayerCommand::Play {
+                track,
+                generation,
+                position,
+                paused,
+            } => {
+                let position = if position.is_finite() {
+                    position.max(0.)
+                } else {
+                    0.
+                };
+                self.cache.cancel();
                 self.handoff = None;
                 self.clear_next();
                 self.epoch = self.epoch.wrapping_add(1);
@@ -482,7 +505,7 @@ impl<W: Fn()> Engine<W> {
                 self.messages.clear();
                 self.active_entry = None;
                 self.last_position = Instant::now() - Duration::from_secs(1);
-                self.paused = false;
+                self.paused = paused;
                 self.current = Some(Playing {
                     binding: Binding {
                         track,
@@ -494,17 +517,19 @@ impl<W: Fn()> Engine<W> {
                     ready: false,
                     ended: false,
                     awaiting_next: false,
-                    position: 0.,
+                    position,
                     duration: None,
-                    seekable: false,
+                    seekable: position > 0.,
                     retries: 0,
                     started: Instant::now(),
                     last_progress: Instant::now(),
                     buffering_since: None,
                     buffering: false,
                     retry_at: None,
+                    cached: false,
+                    cache_started: false,
                 });
-                self.control(json!(["set_property", "pause", false]));
+                self.control(json!(["set_property", "pause", paused]));
                 if self.connection.is_some() {
                     self.load_current();
                 }
@@ -537,6 +562,7 @@ impl<W: Fn()> Engine<W> {
                     media: None,
                     entry: None,
                     attempted: false,
+                    cached: false,
                 });
             }
             PlayerCommand::SetPaused(value) => {
@@ -571,6 +597,7 @@ impl<W: Fn()> Engine<W> {
                 self.resolver = None;
                 self.next = None;
                 self.current = None;
+                self.cache.cancel();
                 self.handoff = None;
                 self.disconnect();
                 if shutdown {
@@ -628,9 +655,19 @@ impl<W: Fn()> Engine<W> {
         }
     }
     fn load_current(&mut self) {
-        let Some(current) = &self.current else { return };
+        let Some(current) = &mut self.current else {
+            return;
+        };
         let binding = current.binding.clone();
-        let mut media = Media::plain((self.source)(&binding.track));
+        let cached = self.cache.lookup(&binding.track.id);
+        current.cached = cached.is_some();
+        let mut media = if let Some(path) = cached {
+            let mut media = Media::plain(path.to_string_lossy().into_owned());
+            media.options["ytdl"] = json!("no");
+            media
+        } else {
+            Media::plain((self.source)(&binding.track))
+        };
         if current.seekable && current.position > 0. {
             media.options["start"] = json!(current.position.to_string());
         }
@@ -670,8 +707,14 @@ impl<W: Fn()> Engine<W> {
         let Some(next) = &mut self.next else { return };
         if !next.attempted {
             next.attempted = true;
+            next.cached = false;
             let url = (self.source)(&next.binding.track);
-            if url.starts_with("https://www.youtube.com/watch?") {
+            if let Some(path) = self.cache.lookup(&next.binding.track.id) {
+                let mut media = Media::plain(path.to_string_lossy().into_owned());
+                media.options["ytdl"] = json!("no");
+                next.media = Some(media);
+                next.cached = true;
+            } else if url.starts_with("https://www.youtube.com/watch?") {
                 self.resolver = Resolver::start(&url).ok();
             } else {
                 next.media = Some(Media::plain(url));
@@ -694,6 +737,7 @@ impl<W: Fn()> Engine<W> {
         }
         self.resolver = None;
         self.next = None;
+        self.cache.cancel();
         self.disconnect();
         self.emit(
             generation,
@@ -793,10 +837,12 @@ impl<W: Fn()> Engine<W> {
                     return;
                 }
                 self.resolver = None;
+                let cached = self.next.as_ref().is_some_and(|n| n.cached);
                 self.next = None;
                 let mut binding = binding;
                 binding.transition = None;
                 let previous = self.current.take().unwrap();
+                self.cache.cancel();
                 self.current = Some(Playing {
                     binding,
                     entry: self.active_entry,
@@ -812,6 +858,8 @@ impl<W: Fn()> Engine<W> {
                     buffering_since: None,
                     buffering: false,
                     retry_at: None,
+                    cached,
+                    cache_started: false,
                 });
                 self.last_position = Instant::now() - Duration::from_secs(1);
                 self.handoff = Some(Handoff {
@@ -857,7 +905,15 @@ impl<W: Fn()> Engine<W> {
             return;
         };
         match event {
-            PlaybackEvent::Error(error) => self.fail(error),
+            PlaybackEvent::Error(error) => {
+                if let Some(current) = &self.current
+                    && current.cached
+                    && !current.ready
+                {
+                    self.cache.invalidate(&current.binding.track.id);
+                }
+                self.fail(error);
+            }
             PlaybackEvent::Ended => {
                 let current = self.current.as_ref().unwrap();
                 if premature_eof(
@@ -936,6 +992,7 @@ impl<W: Fn()> Engine<W> {
         }
     }
     fn tick(&mut self) {
+        self.cache.poll();
         if let Some(current) = &mut self.current
             && let Some(retry_at) = current.retry_at
         {
@@ -1058,6 +1115,18 @@ impl<W: Fn()> Engine<W> {
             }
         }
         self.prepare();
+        // Prioritize opening the queued stream over a background cache download.
+        if self.resolver.is_none()
+            && self.handoff.is_none()
+            && let Some(current) = &mut self.current
+            && current.ready
+            && !current.ended
+            && !current.cached
+            && !current.cache_started
+        {
+            current.cache_started = true;
+            self.cache.start(&current.binding.track);
+        }
     }
     fn end(&mut self) {
         if let Some(current) = &mut self.current {
@@ -1072,11 +1141,14 @@ impl<W: Fn()> Engine<W> {
         self.emit(self.generation(), PlaybackEvent::Ended);
     }
     fn busy(&self) -> bool {
-        self.process.is_some() || self.current.as_ref().is_some_and(|c| c.retry_at.is_some())
+        self.process.is_some()
+            || self.cache.downloading()
+            || self.current.as_ref().is_some_and(|c| c.retry_at.is_some())
     }
 }
 impl<W: Fn()> Drop for Engine<W> {
     fn drop(&mut self) {
+        self.cache.cancel();
         self.resolver = None;
         self.disconnect();
     }
@@ -1254,6 +1326,8 @@ mod tests {
         engine.handle(PlayerCommand::Play {
             track: Track::default(),
             generation: 12,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::PrepareNext {
             track: Some(Track {
@@ -1356,6 +1430,8 @@ mod tests {
                 PlayerCommand::Play {
                     track: Track::default(),
                     generation: 20,
+                    position: 0.,
+                    paused: false,
                 }
             });
             engine.audio_clock(1.);
@@ -1373,6 +1449,8 @@ mod tests {
         engine.handle(PlayerCommand::Play {
             track: Track::default(),
             generation: 12,
+            position: 0.,
+            paused: false,
         });
         for _ in 0..3 {
             engine.fail("disconnected".into());
@@ -1400,12 +1478,34 @@ mod tests {
         engine.handle(PlayerCommand::Play {
             track: Track::default(),
             generation: 13,
+            position: 0.,
+            paused: false,
         });
         engine.fail("disconnected".into());
         engine.handle(PlayerCommand::Stop);
         engine.tick();
         assert!(engine.current.is_none());
         assert!(engine.process.is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn ipc_delivers_final_messages_before_reporting_disconnect() {
+        let (stream, mut peer) = IpcStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut connection = Connection {
+            stream,
+            pending: Vec::new(),
+            outgoing: Vec::new(),
+            written: 0,
+        };
+        peer.write_all(b"{\"event\":\"end-file\",\"reason\":\"eof\"}\n")
+            .unwrap();
+        drop(peer);
+        assert_eq!(connection.messages().unwrap().len(), 1);
+        assert_eq!(
+            connection.messages().unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -1509,6 +1609,7 @@ mod integration_tests {
     fn local_engine() -> (Engine<impl Fn()>, Receiver<PlayerEvent>) {
         let (tx, rx) = mpsc::channel();
         let mut engine = Engine::new(tx, || {});
+        engine.cache = AudioCache::at(None);
         engine.source = |track| track.id.clone();
         engine.command = || {
             let mut command = audio_command();
@@ -1555,6 +1656,7 @@ mod integration_tests {
     fn live_youtube_handoff(first: &str, second: &str, tail: f64) {
         let (tx, events) = mpsc::channel();
         let mut engine = Engine::new(tx, || {});
+        engine.cache = AudioCache::at(None);
         engine.command = || {
             let mut command = audio_command();
             command.arg("--ao=null");
@@ -1571,6 +1673,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: a,
             generation: 100,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         engine.handle(PlayerCommand::PrepareNext {
@@ -1642,6 +1746,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: a.track(),
             generation: 10,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         engine.handle(PlayerCommand::PrepareNext {
@@ -1709,6 +1815,8 @@ mod integration_tests {
             engine.handle(PlayerCommand::Play {
                 track: a.track(),
                 generation: 10,
+                position: 0.,
+                paused: false,
             });
             engine.handle(PlayerCommand::SetPaused(true));
             engine.handle(PlayerCommand::PrepareNext {
@@ -1759,6 +1867,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: a.track(),
             generation: 10,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ready));
@@ -1797,6 +1907,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: a.track(),
             generation: 10,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         engine.handle(PlayerCommand::PrepareNext {
@@ -1884,6 +1996,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: a.track(),
             generation: 5,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         engine.handle(PlayerCommand::SetVolume(37));
@@ -1939,6 +2053,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: a.track(),
             generation: 8,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ready));
@@ -1968,6 +2084,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: a.track(),
             generation: 1,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         engine.handle(PlayerCommand::PrepareNext {
@@ -1995,6 +2113,8 @@ mod integration_tests {
         engine.handle(PlayerCommand::Play {
             track: b.track(),
             generation: 2,
+            position: 0.,
+            paused: false,
         });
         engine.handle(PlayerCommand::SetPaused(true));
         drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ready));
@@ -2009,6 +2129,8 @@ mod integration_tests {
                 ..Default::default()
             },
             generation: 3,
+            position: 0.,
+            paused: false,
         });
         drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ended));
         assert_eq!(engine.current.as_ref().unwrap().retries, 2);

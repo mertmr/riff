@@ -19,6 +19,8 @@ pub struct Session {
     pub recent: Vec<Track>,
     pub queue: Vec<Track>,
     pub volume: u8,
+    pub current: Option<Track>,
+    pub position: f64,
     pub saved_tracks: Arc<Vec<Track>>,
     pub albums: Arc<Vec<SavedAlbum>>,
     pub artists: Arc<Vec<Collection>>,
@@ -30,6 +32,8 @@ impl Default for Session {
             recent: Vec::new(),
             queue: Vec::new(),
             volume: 70,
+            current: None,
+            position: 0.,
             saved_tracks: Default::default(),
             albums: Default::default(),
             artists: Default::default(),
@@ -67,21 +71,41 @@ pub fn load_library() -> (Vec<Track>, Session, Option<String>) {
     let mut favorites = favorites.unwrap_or_default();
     let mut session = session.unwrap_or_default();
     sanitize(&mut favorites);
-    sanitize(&mut session.recent);
-    sanitize(&mut session.queue);
-    sanitize(Arc::make_mut(&mut session.saved_tracks));
-    let mut ids = std::collections::HashSet::new();
-    Arc::make_mut(&mut session.playlists)
-        .retain(|p| p.id > 0 && !p.title.trim().is_empty() && ids.insert(p.id));
-    for playlist in Arc::make_mut(&mut session.playlists) {
-        sanitize(&mut playlist.tracks);
-    }
-    for album in Arc::make_mut(&mut session.albums) {
-        sanitize(&mut album.tracks);
-    }
-    session.recent.truncate(40);
-    session.volume = session.volume.min(100);
+    session.sanitize();
     (favorites, session, error)
+}
+impl Session {
+    fn sanitize(&mut self) {
+        sanitize(&mut self.recent);
+        sanitize(&mut self.queue);
+        sanitize(Arc::make_mut(&mut self.saved_tracks));
+        let mut ids = std::collections::HashSet::new();
+        Arc::make_mut(&mut self.playlists)
+            .retain(|p| p.id > 0 && !p.title.trim().is_empty() && ids.insert(p.id));
+        for playlist in Arc::make_mut(&mut self.playlists) {
+            sanitize(&mut playlist.tracks);
+        }
+        for album in Arc::make_mut(&mut self.albums) {
+            sanitize(&mut album.tracks);
+        }
+        self.recent.truncate(40);
+        self.volume = self.volume.min(100);
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|t| !is_valid_video_id(&t.id) || t.title.trim().is_empty())
+        {
+            self.current = None;
+        }
+        if self.current.is_none() || !self.position.is_finite() || self.position < 0. {
+            self.position = 0.;
+        }
+        if let Some(duration) = self.current.as_ref().and_then(|t| t.duration_seconds)
+            && self.position >= duration as f64
+        {
+            self.position = 0.;
+        }
+    }
 }
 fn sanitize(tracks: &mut Vec<Track>) {
     tracks.retain(|t| is_valid_video_id(&t.id) && !t.title.trim().is_empty());
@@ -247,6 +271,8 @@ mod tests {
             recent: vec![track.clone()],
             queue: vec![track],
             volume: 37,
+            current: session_track(),
+            position: 42.5,
             ..Default::default()
         };
         save_to(&path, &session).unwrap();
@@ -254,9 +280,13 @@ mod tests {
         assert_eq!(loaded.queue, session.queue);
         assert_eq!(loaded.recent, session.recent);
         assert_eq!(loaded.volume, 37);
+        assert_eq!(loaded.current, session.current);
+        assert_eq!(loaded.position, 42.5);
         let old: Session = serde_json::from_str("{}").unwrap();
         assert_eq!(old.volume, 70);
         assert!(old.queue.is_empty());
+        assert!(old.current.is_none());
+        assert_eq!(old.position, 0.);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -303,5 +333,33 @@ mod tests {
         assert_eq!(loaded.artists.len(), 1);
         let old: Session = serde_json::from_str(r#"{"queue":[],"volume":50}"#).unwrap();
         assert!(old.playlists.is_empty() && old.albums.is_empty() && old.saved_tracks.is_empty());
+    }
+    fn session_track() -> Option<Track> {
+        Some(Track {
+            id: "dQw4w9WgXcQ".into(),
+            title: "Test".into(),
+            artist: "Test".into(),
+            duration_seconds: Some(180),
+            ..Default::default()
+        })
+    }
+    #[test]
+    fn invalid_resume_state_cannot_poison_the_session() {
+        let mut session = Session {
+            current: session_track(),
+            ..Default::default()
+        };
+        for position in [f64::NAN, f64::INFINITY, -1., 180., 200.] {
+            session.position = position;
+            session.sanitize();
+            assert_eq!(session.position, 0.);
+        }
+        session.position = 42.5;
+        session.sanitize();
+        assert_eq!(session.position, 42.5);
+        session.current.as_mut().unwrap().id = "invalid".into();
+        session.sanitize();
+        assert!(session.current.is_none());
+        assert_eq!(session.position, 0.);
     }
 }
