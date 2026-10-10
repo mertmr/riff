@@ -46,7 +46,6 @@ pub enum PlaybackEvent {
     Position(f64),
     Duration(f64),
     Seekable(bool),
-    Volume(u8),
     Stopped,
     Ended,
     Error(String),
@@ -68,6 +67,12 @@ pub fn start_player(
     let (events, event_rx) = mpsc::channel();
     let worker = thread::spawn(move || player_loop(rx, events, wake));
     (tx, event_rx, worker)
+}
+
+fn mpv_volume(volume: u8) -> f64 {
+    // mpv cubes its volume percentage. Undo that taper so Riff's percentage
+    // controls signal amplitude directly (50% is half amplitude, not one eighth).
+    (f64::from(volume.min(100)) / 100.).cbrt() * 100.
 }
 
 #[cfg(unix)]
@@ -225,6 +230,8 @@ const AUDIO_OPTIONS: &[&str] = &[
     "--gapless-audio=yes",
     "--audio-samplerate=48000",
     "--audio-channels=stereo",
+    // Keep software volume changes from sitting behind 200 ms of queued PCM.
+    "--audio-buffer=0.05",
     "--prefetch-playlist=yes",
 ];
 
@@ -235,7 +242,15 @@ fn audio_command() -> Command {
     // in the streaming subprocess. This is local to mpv, not a system setting.
     // See apple-oss-distributions/libmalloc/src/malloc.c: MallocLargeCache.
     #[cfg(target_os = "macos")]
-    command.env("MallocLargeCache", "0");
+    {
+        command.env("MallocLargeCache", "0");
+        // AVFoundation queues about two seconds of already scaled samples,
+        // regardless of --audio-buffer. CoreAudio consumes PCM in callbacks,
+        // so live software volume changes reach the output without that queue.
+        // Opus decodes to planar float, which some CoreAudio AudioUnits reject
+        // with an invalid channel-layout error. Request interleaved PCM.
+        command.args(["--ao=coreaudio", "--audio-format=float"]);
+    }
     command
 }
 
@@ -351,9 +366,7 @@ impl<W: Fn()> Engine<W> {
                 // device is still playing the previous file's buffered tail.
                 if matches!(
                     event,
-                    PlaybackEvent::Paused(_)
-                        | PlaybackEvent::Volume(_)
-                        | PlaybackEvent::ControlError(_)
+                    PlaybackEvent::Paused(_) | PlaybackEvent::ControlError(_)
                 ) {
                     handoff.previous.binding.generation
                 } else {
@@ -617,8 +630,10 @@ impl<W: Fn()> Engine<W> {
                 self.control(json!(["set_property", "pause", value]));
             }
             PlayerCommand::SetVolume(value) => {
+                // Volume belongs to the UI: observing old mpv echoes would undo
+                // newer drag positions before the next command reaches mpv.
                 self.volume = value.min(100);
-                self.control(json!(["set_property", "volume", self.volume]));
+                self.control(json!(["set_property", "volume", mpv_volume(self.volume)]));
             }
             PlayerCommand::Seek(position) if position.is_finite() => {
                 if self.restore_audible_track(Some(position)) {
@@ -678,7 +693,7 @@ impl<W: Fn()> Engine<W> {
         command.args(&self.extra_args);
         match Child::spawn_player(
             command
-                .arg(format!("--volume={}", self.volume))
+                .arg(format!("--volume={}", mpv_volume(self.volume)))
                 .arg(format!(
                     "--pause={}",
                     if self.paused { "yes" } else { "no" }
@@ -1183,7 +1198,6 @@ impl<W: Fn()> Engine<W> {
                 "pause",
                 "paused-for-cache",
                 "seekable",
-                "volume",
                 "audio-pts",
                 "idle-active",
             ]
@@ -1192,7 +1206,7 @@ impl<W: Fn()> Engine<W> {
             {
                 self.control(json!(["observe_property", i + 1, property]));
             }
-            self.control(json!(["set_property", "volume", self.volume]));
+            self.control(json!(["set_property", "volume", mpv_volume(self.volume)]));
             self.control(json!(["set_property", "pause", self.paused]));
             if self.connection.is_some() {
                 self.load_current();
@@ -1386,10 +1400,6 @@ fn parse_message(value: &Value) -> Option<PlaybackEvent> {
                 "pause" => data.as_bool().map(PlaybackEvent::Paused),
                 "paused-for-cache" => data.as_bool().map(PlaybackEvent::Buffering),
                 "seekable" => data.as_bool().map(PlaybackEvent::Seekable),
-                "volume" => data
-                    .as_f64()
-                    .filter(|v| v.is_finite())
-                    .map(|v| PlaybackEvent::Volume(v.clamp(0., 100.) as u8)),
                 _ => None,
             }
         }
@@ -2420,6 +2430,145 @@ mod integration_tests {
                 .all(|e| !matches!(e.event, PlaybackEvent::Ended))
         );
     }
+    #[test]
+    #[ignore = "requires mpv and, on macOS, an audio device; verifies the production audio output"]
+    fn mpv_engine_applies_volume_during_playback() {
+        let audio = AudioFile::wav(10, 0);
+        check_live_volume(&audio);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires mpv, ffmpeg and an audio device; verifies Opus decoding on CoreAudio"]
+    fn mpv_coreaudio_plays_opus_and_applies_live_volume() {
+        let source = AudioFile::wav(10, 0);
+        let compressed = AudioFile(source.0.with_extension("webm"));
+        let encoded = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(&source.0)
+            .args(["-c:a", "libopus"])
+            .arg(&compressed.0)
+            .status()
+            .expect("ffmpeg must be installed");
+        assert!(encoded.success());
+        check_live_volume(&compressed);
+    }
+
+    fn check_live_volume(audio: &AudioFile) {
+        let (mut engine, _) = local_engine();
+        // Exercise the real output on macOS. A null AO cannot reproduce
+        // AVFoundation's two-second queue of already volume-scaled audio.
+        #[cfg(target_os = "macos")]
+        {
+            engine.command = audio_command;
+        }
+        engine.handle(PlayerCommand::SetVolume(50));
+        engine.handle(PlayerCommand::Play {
+            track: audio.track(),
+            generation: 10,
+            position: 0.,
+            paused: false,
+            selected_at: Instant::now(),
+        });
+        drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ready));
+        let pid = engine.process.as_ref().unwrap().id();
+        fn property(connection: &mut Connection, name: &str) -> Value {
+            connection
+                .send(json!({"command":["get_property",name],"request_id":777}))
+                .unwrap();
+            let started = Instant::now();
+            loop {
+                for message in connection.messages().unwrap() {
+                    if message["request_id"] == 777 {
+                        assert_eq!(message["error"], "success");
+                        return message["data"].clone();
+                    }
+                }
+                assert!(
+                    started.elapsed() < Duration::from_millis(500),
+                    "volume command was delayed"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                property(engine.connection.as_mut().unwrap(), "current-ao"),
+                "coreaudio"
+            );
+            assert_eq!(
+                property(engine.connection.as_mut().unwrap(), "audio-out-params")["format"],
+                "float"
+            );
+        }
+        let actual = property(engine.connection.as_mut().unwrap(), "volume")
+            .as_f64()
+            .unwrap();
+        assert!(
+            (actual - 79.3700526).abs() < 0.0001,
+            "startup volume: {actual}"
+        );
+        for volume in [20, 21, 50, 0, 23, 100, 37] {
+            engine.handle(PlayerCommand::SetVolume(volume));
+            let actual = property(engine.connection.as_mut().unwrap(), "volume")
+                .as_f64()
+                .unwrap();
+            assert!(
+                (actual - mpv_volume(volume)).abs() < 0.0001,
+                "live volume: {actual}"
+            );
+            assert_eq!(engine.process.as_ref().unwrap().id(), pid);
+            assert_eq!(engine.volume, volume);
+            assert!(!engine.paused);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires mpv; verifies the volume curve against rendered PCM samples"]
+    fn mpv_volume_percentages_produce_linear_audio_amplitude() {
+        let input = AudioFile::wav(1, 8192);
+        let output = AudioFile(input.0.with_extension("volume.wav"));
+        for (volume, expected) in [
+            (0, 0),
+            (25, 2048),
+            (50, 4096),
+            (75, 6144),
+            (100, 8192),
+            (255, 8192),
+        ] {
+            let status = audio_command()
+                .args(["--ao=pcm", "--audio-format=s16", "--idle=no"])
+                .arg(format!("--volume={}", mpv_volume(volume)))
+                .arg(format!("--ao-pcm-file={}", output.0.display()))
+                .arg(&input.0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("mpv must be installed");
+            assert!(status.success());
+            let bytes = std::fs::read(&output.0).unwrap();
+            let mut offset = 12;
+            let pcm = loop {
+                let size =
+                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                if &bytes[offset..offset + 4] == b"data" {
+                    break &bytes[offset + 8..offset + 8 + size];
+                }
+                offset += 8 + size + size % 2;
+            };
+            assert_eq!(pcm.len(), 48_000 * 2 * 2);
+            for sample in pcm.as_chunks::<2>().0 {
+                let actual = i16::from_le_bytes(*sample);
+                assert!(
+                    (i32::from(actual) - expected).abs() <= 1,
+                    "volume {volume}: sample {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires mpv on PATH; exercises real JSON IPC with local audio"]
     fn mpv_pause_volume_and_seek() {

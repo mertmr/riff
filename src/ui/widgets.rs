@@ -132,49 +132,119 @@ pub fn slider(
     label: &str,
 ) -> Option<f64> {
     let id = ui.id().with(id);
+    let volume = label == "Volume";
     let response = ui.interact(
         rect,
         id,
         if enabled {
-            Sense::click_and_drag()
+            if commit {
+                Sense::click_and_drag()
+            } else {
+                // Continuous controls start on press, without click/drag arbitration.
+                Sense::drag()
+            }
         } else {
             Sense::hover()
         },
     );
-    response.widget_info(|| egui::WidgetInfo::slider(enabled, value, label));
-    let dragged = response.dragged() || response.drag_stopped();
+    let dragged = response.is_pointer_button_down_on() || response.drag_stopped();
     let mut next = if dragged {
         ui.ctx().data(|d| d.get_temp::<f64>(id)).unwrap_or(value)
     } else {
         value
     };
     if enabled
-        && (response.clicked() || response.dragged() || response.drag_stopped())
+        && (response.clicked() || dragged)
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        next = ((pointer.x - rect.left()) / rect.width()).clamp(0., 1.) as f64 * max;
+        next = ((pointer.x - rect.left()) as f64 / rect.width() as f64).clamp(0., 1.) * max;
         ui.ctx().data_mut(|d| d.insert_temp(id, next));
+        response.request_focus();
     }
+    let step = if volume { 1. } else { (max / 20.).min(5.) };
     let keyboard = if enabled && response.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    vertical_arrows: volume,
+                    ..Default::default()
+                },
+            );
+        });
         ui.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
-                1.
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
-                -1.
-            } else {
-                0.
+            let mut delta = 0.;
+            for (modifiers, multiplier) in
+                [(egui::Modifiers::SHIFT, 5.), (egui::Modifiers::NONE, 1.)]
+            {
+                if i.consume_key(modifiers, egui::Key::ArrowRight)
+                    || (volume && i.consume_key(modifiers, egui::Key::ArrowUp))
+                {
+                    delta += step * multiplier;
+                }
+                if i.consume_key(modifiers, egui::Key::ArrowLeft)
+                    || (volume && i.consume_key(modifiers, egui::Key::ArrowDown))
+                {
+                    delta -= step * multiplier;
+                }
             }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                delta = -next;
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                delta = max - next;
+            }
+            delta
         })
     } else {
         0.
     };
     if keyboard != 0. {
-        next = (next + keyboard * (max / 20.).min(5.)).clamp(0., max);
+        next = (next + keyboard).clamp(0., max);
     }
-    let accessible = if enabled {
+    let mut scrolled = false;
+    if enabled && volume && response.hovered() {
+        let scroll = ui.input_mut(|input| {
+            let mut delta = 0.;
+            input.events.retain(|event| {
+                if let egui::Event::MouseWheel {
+                    unit, delta: wheel, ..
+                } = event
+                {
+                    let amount = if wheel.y != 0. { wheel.y } else { wheel.x } as f64;
+                    delta += amount
+                        * match unit {
+                            egui::MouseWheelUnit::Point => 0.125,
+                            egui::MouseWheelUnit::Line => 5.,
+                            egui::MouseWheelUnit::Page => 100.,
+                        };
+                    false
+                } else {
+                    true
+                }
+            });
+            if delta != 0. {
+                input.smooth_scroll_delta = egui::Vec2::ZERO;
+            }
+            delta
+        });
+        let remainder_id = id.with("scroll_remainder");
+        if scroll != 0. {
+            scrolled = true;
+            let remainder = ui
+                .ctx()
+                .data(|d| d.get_temp::<f64>(remainder_id))
+                .unwrap_or(0.);
+            let target = (next + remainder + scroll).clamp(0., max);
+            next = target.round();
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(remainder_id, target - next));
+        }
+    }
+    let (accessible, accessible_step) = if enabled {
         ui.input(|input| {
             use egui::accesskit::{Action, ActionData};
-            input
+            let value = input
                 .accesskit_action_requests(id, Action::SetValue)
                 .find_map(|request| {
                     if let Some(ActionData::NumericValue(v)) = request.data {
@@ -182,20 +252,31 @@ pub fn slider(
                     } else {
                         None
                     }
-                })
+                });
+            let delta = input.num_accesskit_action_requests(id, Action::Increment) as f64
+                - input.num_accesskit_action_requests(id, Action::Decrement) as f64;
+            (value, delta * step)
         })
     } else {
-        None
-    }
-    .filter(|v| v.is_finite());
+        (None, 0.)
+    };
+    let accessible = accessible.filter(|v| v.is_finite());
+    next = (next + accessible_step).clamp(0., max);
     if let Some(v) = accessible {
         next = v.clamp(0., max);
     }
+    if volume {
+        next = next.round();
+    }
+    response.widget_info(|| egui::WidgetInfo::slider(enabled, next, label));
     ui.ctx().accesskit_node_builder(id, |node| {
         node.set_min_numeric_value(0.);
         node.set_max_numeric_value(max);
+        node.set_numeric_value_step(step);
         if enabled {
             node.add_action(egui::accesskit::Action::SetValue);
+            node.add_action(egui::accesskit::Action::Increment);
+            node.add_action(egui::accesskit::Action::Decrement);
         }
     });
     let ratio = if max > 0. {
@@ -216,7 +297,7 @@ pub fn slider(
             ],
             Stroke::new(
                 3.,
-                if label != "Volume" || response.hovered() || dragged {
+                if !volume || response.hovered() || dragged || response.has_focus() {
                     ACCENT
                 } else {
                     MUTED
@@ -224,13 +305,29 @@ pub fn slider(
             ),
         );
     }
-    if enabled && (response.hovered() || dragged || response.has_focus()) {
+    if enabled && (volume || response.hovered() || dragged || response.has_focus()) {
         ui.painter()
             .circle_filled(pos2(rect.left() + rect.width() * ratio as f32, y), 5., TEXT);
     }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.),
+            6,
+            Stroke::new(1., ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if enabled {
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
     response.clone().on_hover_text(if enabled {
         if label == "Volume" {
-            format!("Volume: {}%", next.round() as u8)
+            format!(
+                "Volume: {}% · Scroll to adjust · Arrow keys: 1% · Shift: 5%",
+                next as u8
+            )
         } else {
             format!("{label}: {}", time(next))
         }
@@ -238,9 +335,12 @@ pub fn slider(
         "Available once audio is ready".into()
     });
     if enabled
-        && ((response.clicked() || response.drag_stopped() || (!commit && response.dragged()))
+        && ((response.clicked() || response.drag_stopped() || (!commit && dragged))
             || keyboard != 0.
-            || accessible.is_some())
+            || accessible.is_some()
+            || accessible_step != 0.
+            || scrolled)
+        && next != value
     {
         Some(next)
     } else {
@@ -700,6 +800,215 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn volume_changes_on_press_and_every_drag_movement_before_release() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(20., 20.), vec2(100., 40.));
+        let mut current = 70.;
+        let mut frame = |events| {
+            let mut changed = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400., 200.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    changed = slider(ui, "volume", rect, current, 100., true, false, "Volume");
+                    if let Some(value) = changed {
+                        current = value;
+                    }
+                },
+            );
+            output.textures_delta.clear();
+            changed
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(frame(vec![]), None);
+        let press = pos2(40., 22.);
+        assert_eq!(
+            frame(vec![egui::Event::PointerMoved(press), button(press, true)]),
+            Some(20.)
+        );
+        // A movement smaller than egui's click/drag threshold still changes volume.
+        assert_eq!(
+            frame(vec![egui::Event::PointerMoved(pos2(42., 22.))]),
+            Some(22.)
+        );
+        assert_eq!(
+            frame(vec![egui::Event::PointerMoved(pos2(80., 90.))]),
+            Some(60.)
+        );
+        assert_eq!(
+            frame(vec![egui::Event::PointerMoved(pos2(160., 90.))]),
+            Some(100.)
+        );
+        assert_eq!(frame(vec![]), None);
+        assert_eq!(
+            frame(vec![egui::Event::PointerMoved(pos2(0., 90.))]),
+            Some(0.)
+        );
+        assert_eq!(frame(vec![button(pos2(0., 90.), false)]), None);
+        assert_eq!(current, 0.);
+    }
+
+    #[test]
+    fn seeking_previews_the_drag_and_only_commits_on_release() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(20., 20.), vec2(100., 40.));
+        let frame = |events| {
+            let mut value = None;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400., 200.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| value = slider(ui, "seek", rect, 10., 100., true, true, "Seek"),
+            );
+            output.textures_delta.clear();
+            value
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![]);
+        let press = pos2(40., 40.);
+        assert_eq!(
+            frame(vec![egui::Event::PointerMoved(press), button(press, true)]),
+            None
+        );
+        assert_eq!(frame(vec![egui::Event::PointerMoved(pos2(90., 40.))]), None);
+        assert_eq!(frame(vec![button(pos2(90., 40.), false)]), Some(70.));
+    }
+
+    #[test]
+    fn volume_keyboard_scroll_and_accessibility_are_precise_and_clamped() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("volume");
+        let rect = Rect::from_min_size(pos2(20., 20.), vec2(100., 40.));
+        let mut current = 50.;
+        let mut frame = |events, enabled| {
+            let mut actual_id = egui::Id::NULL;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400., 200.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    actual_id = ui.id().with(id);
+                    ui.memory_mut(|m| m.request_focus(actual_id));
+                    if let Some(value) =
+                        slider(ui, id, rect, current, 100., enabled, false, "Volume")
+                    {
+                        current = value;
+                    }
+                },
+            );
+            output.textures_delta.clear();
+            (actual_id, current)
+        };
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let (actual_id, _) = frame(vec![], true);
+        assert_eq!(
+            frame(
+                vec![key(egui::Key::ArrowRight, egui::Modifiers::NONE)],
+                true
+            )
+            .1,
+            51.
+        );
+        assert_eq!(
+            frame(
+                vec![key(egui::Key::ArrowDown, egui::Modifiers::SHIFT)],
+                true
+            )
+            .1,
+            46.
+        );
+        assert_eq!(
+            frame(vec![key(egui::Key::End, egui::Modifiers::NONE)], true).1,
+            100.
+        );
+        assert_eq!(
+            frame(vec![key(egui::Key::ArrowUp, egui::Modifiers::NONE)], true).1,
+            100.
+        );
+        assert_eq!(
+            frame(vec![key(egui::Key::Home, egui::Modifiers::NONE)], true).1,
+            0.
+        );
+        let wheel = |unit, y| egui::Event::MouseWheel {
+            unit,
+            delta: vec2(0., y),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        };
+        assert_eq!(
+            frame(
+                vec![
+                    egui::Event::PointerMoved(rect.center()),
+                    wheel(egui::MouseWheelUnit::Line, 1.)
+                ],
+                true
+            )
+            .1,
+            5.
+        );
+        // Sub-percent trackpad deltas accumulate rather than getting discarded.
+        assert_eq!(
+            frame(vec![wheel(egui::MouseWheelUnit::Point, 2.)], true).1,
+            5.
+        );
+        assert_eq!(
+            frame(vec![wheel(egui::MouseWheelUnit::Point, 2.)], true).1,
+            6.
+        );
+        let request = |action| {
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: actual_id.accesskit_id(),
+                data: None,
+            })
+        };
+        assert_eq!(
+            frame(vec![request(egui::accesskit::Action::Increment)], true).1,
+            7.
+        );
+        assert_eq!(
+            frame(vec![request(egui::accesskit::Action::Decrement)], true).1,
+            6.
+        );
+        assert_eq!(
+            frame(
+                vec![
+                    key(egui::Key::End, egui::Modifiers::NONE),
+                    wheel(egui::MouseWheelUnit::Line, 1.),
+                    request(egui::accesskit::Action::Increment)
+                ],
+                false
+            )
+            .1,
+            6.
+        );
     }
 
     #[test]

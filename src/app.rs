@@ -1090,7 +1090,6 @@ impl MusicApp {
                 }
                 PlaybackEvent::Duration(value) => self.duration = Some(value),
                 PlaybackEvent::Seekable(value) => self.seekable = value,
-                PlaybackEvent::Volume(value) => self.volume = value,
                 PlaybackEvent::Stopped => {
                     self.playback = Playback::Stopped;
                     self.buffering = false;
@@ -1348,11 +1347,15 @@ impl MusicApp {
             Action::ToggleQueue => self.queue_open = !self.queue_open,
             Action::Volume(v) => {
                 let v = v.min(100);
+                if self.volume == v {
+                    return;
+                }
                 self.volume = v;
                 if v > 0 {
                     self.unmuted_volume = v;
                 }
                 let _ = self.player_tx.send(PlayerCommand::SetVolume(v));
+                ctx.request_repaint();
                 self.persist();
             }
             Action::Mute => self.dispatch(
@@ -2853,6 +2856,86 @@ mod tests {
         app.dispatch(Action::LibraryTab(LibraryTab::Recent), &ctx);
         assert!(app.library.is_empty());
     }
+    #[test]
+    fn player_bar_sends_volume_commands_before_pointer_release() {
+        for (width, start, midpoint) in [(1280., 1104., 1136.), (960., 814., 836.)] {
+            let (mut app, commands, _, ctx) = fixture();
+            let frame = |app: &mut MusicApp, events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 800.),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.shortcuts(ui.ctx());
+                        crate::ui::show(app, ui);
+                    },
+                );
+                output.textures_delta.clear();
+            };
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(&mut app, vec![]);
+            let press = egui::pos2(start, 744.);
+            frame(
+                &mut app,
+                vec![egui::Event::PointerMoved(press), button(press, true)],
+            );
+            assert_eq!(app.volume, 25);
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                PlayerCommand::SetVolume(25)
+            ));
+            frame(
+                &mut app,
+                vec![egui::Event::PointerMoved(egui::pos2(midpoint, 744.))],
+            );
+            assert_eq!(app.volume, 50);
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                PlayerCommand::SetVolume(50)
+            ));
+            frame(&mut app, vec![button(egui::pos2(midpoint, 744.), false)]);
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn volume_edits_keep_the_latest_value_and_skip_duplicate_commands() {
+        let (mut app, commands, _, ctx) = fixture();
+        for volume in [30, 30, 31, 0, 90, 255, 100] {
+            app.dispatch(Action::Volume(volume), &ctx);
+        }
+        let sent: Vec<_> = commands
+            .try_iter()
+            .map(|command| {
+                let PlayerCommand::SetVolume(volume) = command else {
+                    panic!("unexpected command")
+                };
+                volume
+            })
+            .collect();
+        assert_eq!(sent, [30, 31, 0, 90, 100]);
+        assert_eq!(app.volume, 100);
+        app.dispatch(Action::Mute, &ctx);
+        app.dispatch(Action::Mute, &ctx);
+        assert_eq!(app.volume, 100);
+        // Dragging away from mute establishes the volume restored by the mute button.
+        app.dispatch(Action::Volume(0), &ctx);
+        app.dispatch(Action::Volume(23), &ctx);
+        app.dispatch(Action::Mute, &ctx);
+        app.dispatch(Action::Mute, &ctx);
+        assert_eq!(app.volume, 23);
+    }
+
     #[test]
     fn mute_restores_volume_and_seek_needs_a_current_track() {
         let (mut app, commands, _, ctx) = fixture();

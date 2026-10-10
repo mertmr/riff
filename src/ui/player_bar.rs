@@ -300,10 +300,10 @@ fn extras(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
         actions.push(Action::Mute);
     }
     let volume = Rect::from_min_size(
-        pos2(mute.right() + 8., y - 12.),
-        vec2(q.left() - mute.right() - 24., 24.),
+        pos2(mute.right() + 8., y - 20.),
+        vec2(q.left() - mute.right() - 24., 40.),
     );
-    if let Some(v) = widgets::slider(
+    let next_volume = widgets::slider(
         ui,
         "volume",
         volume,
@@ -312,13 +312,14 @@ fn extras(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
         true,
         false,
         "Volume",
-    ) {
+    );
+    if let Some(v) = next_volume {
         actions.push(Action::Volume(v.round() as u8));
     }
     widgets::text(
         ui,
         Rect::from_center_size(pos2(volume.center().x, y + 28.), vec2(72., 16.)),
-        &format!("{}%", app.volume),
+        &format!("{}%", next_volume.map_or(app.volume, |v| v as u8)),
         10.,
         DIM,
     );
