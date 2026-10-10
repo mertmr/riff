@@ -1,3 +1,4 @@
+mod account;
 mod app;
 mod audio_cache;
 mod catalog;

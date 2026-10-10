@@ -1,3 +1,4 @@
+mod account;
 mod artwork;
 mod collections;
 pub mod icons;

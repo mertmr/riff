@@ -217,7 +217,7 @@ fn collection_shortcut(
 pub fn topbar(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     let width = ui.available_width();
     ui.horizontal(|ui| {
-        let search_width = (width - 56.).min(608.);
+        let search_width = (width - 152.).min(608.);
         egui::Frame::new()
             .fill(SURFACE)
             .corner_radius(24)
@@ -311,6 +311,17 @@ pub fn topbar(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
             {
                 actions.push(Action::ToggleQueue);
             }
+            if ui
+                .button(if app.account.library.is_some() {
+                    "Account"
+                } else {
+                    "Sign in"
+                })
+                .on_hover_text("Google / YouTube account")
+                .clicked()
+            {
+                actions.push(Action::Navigate(View::Account));
+            }
         });
     });
 }
@@ -324,6 +335,7 @@ pub fn content(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
             super::collections::library(app, ui, actions)
         }
         View::Collection => super::collections::detail(app, ui, actions),
+        View::Account => super::account::show(app, ui, actions),
     }
 }
 fn home(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -359,8 +371,12 @@ fn home(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                 });
                 if !compact {
                     ui.label(
-                        RichText::new("Related songs from YouTube, inspired by your listening.")
-                            .color(MUTED),
+                        RichText::new(if app.account.library.is_some() {
+                            "Related songs inspired by your listening and YouTube likes."
+                        } else {
+                            "Related songs from YouTube, inspired by your listening."
+                        })
+                        .color(MUTED),
                     );
                 }
                 ui.add_space(8.);

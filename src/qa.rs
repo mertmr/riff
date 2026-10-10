@@ -149,6 +149,42 @@ pub fn configure(app: &mut MusicApp) {
         app.queue.clear();
     }
     match std::env::var("RIFF_VIEW").as_deref() {
+        Ok(
+            "account" | "account-connected" | "account-playlist" | "account-error"
+            | "account-loading",
+        ) => {
+            app.view = View::Account;
+            app.account.config = Default::default();
+            if std::env::var("RIFF_VIEW").is_ok_and(|v| v == "account-loading") {
+                app.account.loading = true;
+            }
+            if std::env::var("RIFF_VIEW").is_ok_and(|v| v == "account-error") {
+                app.account.error =
+                    Some("Google sign-in expired. Disconnect and sign in again.".into());
+            }
+            if std::env::var("RIFF_VIEW")
+                .is_ok_and(|v| matches!(v.as_str(), "account-connected" | "account-playlist"))
+            {
+                let playlist = Collection {
+                    id: "PL-private-fixture".into(),
+                    title: "My private evening mix".into(),
+                    subtitle: "8 videos".into(),
+                    kind: CollectionKind::Playlist,
+                    thumbnail: None,
+                    params: None,
+                };
+                app.account.library = Some(crate::account::Library {
+                    name: "Riff listener".into(),
+                    likes: app.results.clone(),
+                    subscriptions: app.artists.clone(),
+                    playlists: vec![playlist.clone()],
+                });
+                if std::env::var("RIFF_VIEW").is_ok_and(|v| v == "account-playlist") {
+                    app.account.playlist =
+                        Some((playlist, crate::catalog::Page::from(app.results.clone())));
+                }
+            }
+        }
         Ok("home-loading") => {
             app.recommendations.tracks.clear();
             app.recommendations.searching = true;
