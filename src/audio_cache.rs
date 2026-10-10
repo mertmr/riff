@@ -1,13 +1,9 @@
-use crate::{
-    model::{Track, is_valid_video_id},
-    player::process::ChildProcess as Child,
-};
+use crate::model::is_valid_video_id;
 use directories::ProjectDirs;
 use std::{
     fs::{self, File, FileTimes},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 const CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -17,24 +13,6 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct AudioCache {
     dir: Option<PathBuf>,
-    download: Option<Download>,
-    sequence: u64,
-}
-
-struct Download {
-    child: Child,
-    dir: PathBuf,
-    id: String,
-    started: Instant,
-    inspected: Instant,
-}
-
-impl Drop for Download {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = fs::remove_dir_all(&self.dir);
-    }
 }
 
 impl AudioCache {
@@ -44,11 +22,7 @@ impl AudioCache {
 
     pub(crate) fn at(dir: Option<PathBuf>) -> Self {
         let dir = dir.filter(|dir| fs::create_dir_all(dir).is_ok());
-        let cache = Self {
-            dir,
-            download: None,
-            sequence: 0,
-        };
+        let cache = Self { dir };
         if let Some(dir) = &cache.dir
             && let Ok(entries) = fs::read_dir(dir)
         {
@@ -95,108 +69,15 @@ impl AudioCache {
         }
     }
 
-    pub fn cancel(&mut self) {
-        self.download = None;
+    pub(crate) fn publisher(dir: PathBuf) -> Self {
+        Self { dir: Some(dir) }
     }
 
-    pub fn downloading(&self) -> bool {
-        self.download.is_some()
+    pub(crate) fn directory(&self) -> Option<PathBuf> {
+        self.dir.clone()
     }
 
-    pub fn start(&mut self, track: &Track) {
-        self.start_with(track, Path::new("yt-dlp"));
-    }
-
-    fn start_with(&mut self, track: &Track, executable: &Path) {
-        if self.download.is_some()
-            || !is_valid_video_id(&track.id)
-            || self.lookup(&track.id).is_some()
-        {
-            return;
-        }
-        let Some(root) = &self.dir else { return };
-        self.sequence = self.sequence.wrapping_add(1);
-        let dir = root.join(format!("download-{}-{}", std::process::id(), self.sequence));
-        if fs::create_dir(&dir).is_err() {
-            return;
-        }
-        // Preserve native audio: no transcoding, video, or ffmpeg subprocess.
-        let child = Child::spawn(
-            Command::new(executable)
-                .args([
-                    "--ignore-config",
-                    "--no-playlist",
-                    "--no-cache-dir",
-                    "--no-progress",
-                    "--no-warnings",
-                    "--socket-timeout",
-                    "15",
-                    "--retries",
-                    "1",
-                    "--fragment-retries",
-                    "1",
-                    "--max-filesize",
-                    "64M",
-                    "--downloader",
-                    "native",
-                    "--format",
-                    "bestaudio",
-                    "--output",
-                    "audio.%(ext)s",
-                    "--paths",
-                ])
-                .arg(&dir)
-                .args(["--", &track.youtube_url()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null()),
-        );
-        match child {
-            Ok(child) => {
-                self.download = Some(Download {
-                    child,
-                    dir,
-                    id: track.id.clone(),
-                    started: Instant::now(),
-                    inspected: Instant::now(),
-                })
-            }
-            Err(_) => {
-                let _ = fs::remove_dir_all(dir);
-            }
-        }
-    }
-
-    pub fn poll(&mut self) {
-        let Some(download) = &mut self.download else {
-            return;
-        };
-        if download.inspected.elapsed() < Duration::from_millis(250) {
-            return;
-        }
-        download.inspected = Instant::now();
-        let size = fs::read_dir(&download.dir).ok().map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| e.metadata().ok())
-                .map(|m| m.len())
-                .sum::<u64>()
-        });
-        if download.started.elapsed() > DOWNLOAD_TIMEOUT || size.is_none_or(|n| n > TRACK_BYTES) {
-            self.cancel();
-            return;
-        }
-        match download.child.try_wait() {
-            Ok(None) => (),
-            Ok(Some(status)) if status.success() => {
-                let download = self.download.take().unwrap();
-                let _ = self.publish(&download.dir, &download.id);
-            }
-            _ => self.cancel(),
-        }
-    }
-
-    fn publish(&self, staging: &Path, id: &str) -> std::io::Result<()> {
+    pub(crate) fn publish(&self, staging: &Path, id: &str) -> std::io::Result<()> {
         let root = self
             .dir
             .as_ref()
@@ -300,7 +181,6 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            self.cache.cancel();
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
@@ -366,60 +246,6 @@ mod tests {
             std::os::unix::fs::symlink(&outside, &path).unwrap();
             assert!(fixture.cache.lookup(id).is_none());
             assert_eq!(fs::read(outside).unwrap(), b"untouched");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_cancelled_and_timed_out_downloads_leave_no_playable_audio() {
-        use std::os::unix::fs::PermissionsExt;
-        let mut fixture = Fixture::new();
-        let executable = fixture.dir.join("downloader");
-        let track = Track {
-            id: "dQw4w9WgXcQ".into(),
-            title: "Test".into(),
-            artist: "Test".into(),
-            duration_seconds: None,
-            ..Default::default()
-        };
-        fs::write(&executable, "#!/bin/sh\nwhile [ \"$1\" != --paths ]; do shift; done\nshift\nprintf partial > \"$1/audio.webm\"\nexit 1\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        fixture.cache.start_with(&track, &executable);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while fixture.cache.downloading() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
-            fixture.cache.poll();
-        }
-        assert!(fixture.cache.lookup(&track.id).is_none());
-        fs::write(&executable, "#!/bin/sh\nwhile [ \"$1\" != --paths ]; do shift; done\nshift\nprintf complete > \"$1/audio.webm\"\n").unwrap();
-        fixture.cache.start_with(&track, &executable);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while fixture.cache.downloading() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
-            fixture.cache.poll();
-        }
-        assert_eq!(
-            fs::read(fixture.cache.lookup(&track.id).unwrap()).unwrap(),
-            b"complete"
-        );
-        fixture.cache.invalidate(&track.id);
-        fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        for timeout in [false, true] {
-            fixture.cache.start_with(&track, &executable);
-            let download = fixture.cache.download.as_mut().unwrap();
-            let dir = download.dir.clone();
-            if timeout {
-                download.started = Instant::now() - DOWNLOAD_TIMEOUT;
-                download.inspected = Instant::now() - Duration::from_secs(1);
-                fixture.cache.poll();
-            } else {
-                fixture.cache.cancel();
-            }
-            assert!(!fixture.cache.downloading());
-            assert!(!dir.exists());
-            assert!(fixture.cache.lookup(&track.id).is_none());
         }
     }
 }

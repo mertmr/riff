@@ -272,6 +272,7 @@ pub struct MusicApp {
     worker_ctx: egui::Context,
     generation: u64,
     scheduled_next: Option<(u64, u64, Track)>,
+    prepared_following: Vec<Track>,
     player_tx: Sender<PlayerCommand>,
     player_rx: Receiver<PlayerEvent>,
     player_worker: Option<thread::JoinHandle<()>>,
@@ -453,6 +454,7 @@ impl MusicApp {
             worker_ctx: ctx.clone(),
             generation: 0,
             scheduled_next: None,
+            prepared_following: Vec::new(),
             player_tx,
             player_rx,
             player_worker: Some(worker),
@@ -698,6 +700,7 @@ impl MusicApp {
         self.play_from(track, add_history, 0.);
     }
     fn play_from(&mut self, track: Track, add_history: bool, position: f64) {
+        let selected_at = Instant::now();
         self.begin_track(track.clone(), add_history);
         self.position = if position.is_finite() {
             position.max(0.)
@@ -711,6 +714,7 @@ impl MusicApp {
                 generation: self.generation,
                 position: self.position,
                 paused: false,
+                selected_at,
             })
             .is_err()
         {
@@ -723,6 +727,7 @@ impl MusicApp {
     }
     fn begin_track(&mut self, track: Track, add_history: bool) {
         self.scheduled_next = None;
+        self.prepared_following.clear();
         if let Some(radio) = &mut self.radio {
             radio.waiting = false;
             radio.remember(&track.id);
@@ -748,35 +753,56 @@ impl MusicApp {
         self.playback_error = None;
     }
     fn sync_next(&mut self) {
-        let desired = if matches!(
+        let head = if matches!(
             self.playback,
             Playback::Loading | Playback::Playing | Playback::Paused
         ) {
             self.queue_track(0)
-                .map(|track| (self.generation, self.queue_revision, track.clone()))
         } else {
             None
         };
-        // Editing the tail doesn't change the next track or require another
-        // extractor process. Revision identifies the scheduled choice itself.
-        if desired
-            .as_ref()
-            .zip(self.scheduled_next.as_ref())
-            .is_some_and(|(new, old)| new.0 == old.0 && new.2 == old.2)
-        {
+        let same_head =
+            head.zip(self.scheduled_next.as_ref())
+                .is_some_and(|(track, (generation, _, old))| {
+                    *generation == self.generation && track == old
+                });
+        let same_empty = head.is_none() && self.scheduled_next.is_none();
+        let same_following = if head.is_some() {
+            (1..4)
+                .filter_map(|i| self.queue_track(i))
+                .eq(self.prepared_following.iter())
+        } else {
+            self.prepared_following.is_empty()
+        };
+        // The unchanged per-frame path compares references without allocating.
+        if (same_head || same_empty) && same_following {
             return;
         }
-        if desired == self.scheduled_next {
-            return;
+        let desired = head.map(|track| (self.generation, self.queue_revision, track.clone()));
+        let following = if desired.is_some() {
+            (1..4)
+                .filter_map(|i| self.queue_track(i).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Preserve the identity/revision of the scheduled head when only its
+        // following tracks change. A handoff still consumes that same occurrence.
+        if !same_head {
+            self.scheduled_next = desired;
         }
-        self.scheduled_next = desired;
+        self.prepared_following = following;
         let _ = self.player_tx.send(PlayerCommand::PrepareNext {
             track: self
                 .scheduled_next
                 .as_ref()
                 .map(|(_, _, track)| track.clone()),
             generation: self.generation,
-            revision: self.queue_revision,
+            revision: self
+                .scheduled_next
+                .as_ref()
+                .map_or(self.queue_revision, |(_, revision, _)| *revision),
+            following: self.prepared_following.clone(),
         });
     }
     fn transition(&mut self, track: Track, revision: u64) {
@@ -2012,7 +2038,13 @@ mod tests {
         assert!(app.queue_open);
         // Start from the same playing seed without restarting it.
         app.playback = Playback::Playing;
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::PrepareNext { following, .. } if following == vec![c.clone()])
+        );
         app.dispatch(Action::StartRadio(a), &ctx);
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::PrepareNext { following, .. } if following.is_empty())
+        );
         assert!(commands.try_recv().is_err());
         let job = jobs.recv().unwrap();
         results
@@ -2022,6 +2054,9 @@ mod tests {
             })
             .unwrap();
         app.receive();
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::PrepareNext { following, .. } if following == vec![c.clone()])
+        );
         for expected in [b, c] {
             events
                 .send(PlayerEvent {
@@ -2244,6 +2279,50 @@ mod tests {
         ));
     }
     #[test]
+    fn preparation_window_is_bounded_and_tail_edits_preserve_the_handoff_ticket() {
+        let (mut app, commands, _, ctx) = fixture();
+        let tracks: Vec<_> = [
+            "dQw4w9WgXcQ",
+            "hTWKbfoikeg",
+            "4NRXx6U8ABQ",
+            "Eq8ZiZ9xiLw",
+            "-0kcet4aPpQ",
+            "JGwWNGJdvx8",
+        ]
+        .into_iter()
+        .map(track)
+        .collect();
+        app.dispatch(Action::PlayTracks(tracks.clone()), &ctx);
+        commands.recv().unwrap();
+        let PlayerCommand::PrepareNext {
+            track: head,
+            following,
+            revision,
+            ..
+        } = commands.recv().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(head, Some(tracks[1].clone()));
+        assert_eq!(following, tracks[2..5]);
+        // Editing outside the preparation window causes no network work.
+        app.dispatch(Action::QueueRemove(4), &ctx);
+        assert!(commands.try_recv().is_err());
+        app.dispatch(Action::QueueRemove(1), &ctx);
+        let PlayerCommand::PrepareNext {
+            track: head,
+            following,
+            revision: same,
+            ..
+        } = commands.recv().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(head, Some(tracks[1].clone()));
+        assert_eq!(same, revision);
+        assert_eq!(following, tracks[3..5]);
+    }
+    #[test]
     fn native_handoffs_consume_one_occurrence_and_preserve_history() {
         let (mut app, commands, events, ctx) = fixture();
         let a = track("dQw4w9WgXcQ");
@@ -2262,6 +2341,9 @@ mod tests {
         let parent = app.generation;
         // Tail edits preserve the preloaded stream and its scheduling ticket.
         app.dispatch(Action::Enqueue(a.clone(), false), &ctx);
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::PrepareNext { revision: same_revision, following, .. } if same_revision == revision && following == vec![b.clone(), a.clone()])
+        );
         assert!(commands.try_recv().is_err());
         events
             .send(PlayerEvent {
@@ -2317,6 +2399,7 @@ mod tests {
                 generation,
                 revision,
                 track: Some(prepared),
+                ..
             } = commands.recv().unwrap()
             else {
                 panic!("missing radio prefetch")
