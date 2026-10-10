@@ -625,13 +625,20 @@ impl<W: Fn()> Engine<W> {
                     self.load_current();
                     return true;
                 }
+                let position = position.max(0.);
                 if let Some(current) = &mut self.current {
-                    current.position = position.max(0.);
+                    current.position = position;
                     current.last_progress = Instant::now();
                     current.buffering_since =
                         (current.buffering && !self.paused).then(Instant::now);
+                    if current.entry.is_none() && !current.ready {
+                        // Not yet handed to mpv: the pending load picks up the new
+                        // offset via its start option; no mpv command needed.
+                        self.load_pending = true;
+                        return true;
+                    }
                 }
-                self.control(json!(["seek", position.max(0.), "absolute+exact"]));
+                self.control(json!(["seek", position, "absolute+exact"]));
             }
             PlayerCommand::Seek(_) => {}
             PlayerCommand::Stop | PlayerCommand::Shutdown => {
@@ -669,7 +676,7 @@ impl<W: Fn()> Engine<W> {
         let mut command = (self.command)();
         #[cfg(test)]
         command.args(&self.extra_args);
-        match Child::spawn(
+        match Child::spawn_player(
             command
                 .arg(format!("--volume={}", self.volume))
                 .arg(format!(
@@ -761,7 +768,7 @@ impl<W: Fn()> Engine<W> {
         if let Some(trace) = &mut self.trace {
             trace.resolved(&media, current.cached);
         }
-        if current.seekable && current.position > 0. {
+        if current.position > 0. {
             media.options["start"] = json!(current.position.to_string());
         }
         if self.connection.is_some() {

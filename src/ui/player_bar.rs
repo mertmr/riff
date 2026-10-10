@@ -203,15 +203,18 @@ fn transport(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
         pos2(cx, r.top() + 84.),
         vec2((progress_width - 88.).max(64.), 24.),
     );
-    let enabled = app.seekable
-        && app.duration.is_some()
-        && matches!(app.playback, Playback::Playing | Playback::Paused);
+    let duration = app.effective_duration();
+    let enabled = duration.is_some()
+        && matches!(
+            app.playback,
+            Playback::Playing | Playback::Paused | Playback::Loading
+        );
     if let Some(value) = widgets::slider(
         ui,
         "seek",
         progress,
         app.position,
-        app.duration.unwrap_or(0.),
+        duration.unwrap_or(0.),
         enabled,
         true,
         "Seek",
@@ -228,7 +231,7 @@ fn transport(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
     ui.painter().text(
         pos2(progress.right() + 12., progress.center().y),
         Align2::LEFT_CENTER,
-        app.duration.map_or_else(|| "—:—".into(), widgets::time),
+        duration.map_or_else(|| "—:—".into(), widgets::time),
         FontId::proportional(10.),
         DIM,
     );

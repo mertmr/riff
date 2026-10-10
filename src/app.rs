@@ -924,6 +924,14 @@ impl MusicApp {
     pub fn queue_len(&self) -> usize {
         self.queue.len() + self.radio.as_ref().map_or(0, |r| r.upcoming.len())
     }
+    /// Playback duration when mpv has reported one, otherwise the catalog's
+    /// duration estimate so seeking never waits on demuxer metadata.
+    pub fn effective_duration(&self) -> Option<f64> {
+        self.duration.or(self
+            .current
+            .as_ref()
+            .and_then(|t| t.duration_seconds.map(|s| s as f64)))
+    }
     pub fn queue_track(&self, index: usize) -> Option<&Track> {
         if index < self.queue.len() {
             self.queue.get(index)
@@ -1246,7 +1254,7 @@ impl MusicApp {
                 _ => {}
             },
             Action::Previous => {
-                if self.position > 3. && self.seekable {
+                if self.position > 3. {
                     let _ = self.player_tx.send(PlayerCommand::Seek(0.));
                 } else if let Some(track) = self.history.pop() {
                     if let Some(current) = self.current.clone() {
@@ -1356,7 +1364,9 @@ impl MusicApp {
                 ctx,
             ),
             Action::Seek(p) => {
-                if self.seekable {
+                if self.current.is_some() && p.is_finite() {
+                    let max = self.effective_duration().unwrap_or(f64::MAX);
+                    self.position = p.clamp(0., max);
                     let _ = self.player_tx.send(PlayerCommand::Seek(p));
                 }
             }
@@ -1706,7 +1716,7 @@ impl MusicApp {
         }
     }
     pub fn can_previous(&self) -> bool {
-        !self.history.is_empty() || (self.position > 3. && self.seekable)
+        !self.history.is_empty() || self.position > 3.
     }
 }
 impl eframe::App for MusicApp {
@@ -2844,7 +2854,7 @@ mod tests {
         assert!(app.library.is_empty());
     }
     #[test]
-    fn mute_restores_volume_and_seek_requires_real_capability() {
+    fn mute_restores_volume_and_seek_needs_a_current_track() {
         let (mut app, commands, _, ctx) = fixture();
         app.volume = 42;
         app.unmuted_volume = 42;
@@ -2860,7 +2870,7 @@ mod tests {
         ));
         app.dispatch(Action::Seek(15.), &ctx);
         assert!(commands.try_recv().is_err());
-        app.seekable = true;
+        app.current = Some(track("dQw4w9WgXcQ"));
         app.dispatch(Action::Seek(15.), &ctx);
         assert!(matches!(commands.recv().unwrap(), PlayerCommand::Seek(15.)));
     }

@@ -161,21 +161,7 @@ impl Client {
             &value
         };
         let mut page = parse_contents(content, false);
-        let header = find_renderer(&value, "musicResponsiveHeaderRenderer")
-            .or_else(|| find_renderer(&value, "musicDetailHeaderRenderer"));
-        let artist = header
-            .and_then(|h| {
-                h["straplineText"]["runs"]
-                    .as_array()
-                    .or_else(|| h["subtitle"]["runs"].as_array())
-            })
-            .and_then(|runs| {
-                runs.iter().find_map(|r| {
-                    let (id, kind) = browse(&r["navigationEndpoint"])?;
-                    (kind == "MUSIC_PAGE_TYPE_ARTIST")
-                        .then(|| (r["text"].as_str().unwrap_or_default(), id))
-                })
-            });
+        let artist = header_artist(&value);
         for track in &mut page.tracks {
             if collection.kind == CollectionKind::Album {
                 track.album = Some(collection.title.clone());
@@ -215,6 +201,18 @@ fn browse(value: &Value) -> Option<(&str, &str)> {
             .unwrap_or(""),
     ))
 }
+fn header_artist(value: &Value) -> Option<(&str, &str)> {
+    let header = find_renderer(value, "musicResponsiveHeaderRenderer")
+        .or_else(|| find_renderer(value, "musicDetailHeaderRenderer"))?;
+    let runs = ["straplineTextOne", "straplineText", "subtitle"]
+        .iter()
+        .find_map(|key| header[key]["runs"].as_array())?;
+    runs.iter().find_map(|r| {
+        let (id, kind) = browse(&r["navigationEndpoint"])?;
+        (kind == "MUSIC_PAGE_TYPE_ARTIST").then(|| (r["text"].as_str().unwrap_or_default(), id))
+    })
+}
+
 fn duration(label: &str) -> Option<u64> {
     let parts = label.split(':').collect::<Vec<_>>();
     if !(2..=3).contains(&parts.len()) {
@@ -380,6 +378,38 @@ fn parse_contents(value: &Value, unique_tracks: bool) -> Page {
                         }
                         // Menus and headers contain duplicate tracks and unrelated destinations.
                         "menu" | "background" => {}
+                        "musicCardShelfRenderer" => {
+                            // Top songs under an artist card omit the artist because it is
+                            // implied by the card header (e.g. "Song • 4:10" with no
+                            // artist run). Remember the card's artist for those tracks.
+                            let fallback = child
+                                .get("title")
+                                .and_then(|t| t.get("runs"))
+                                .and_then(Value::as_array)
+                                .and_then(|runs| {
+                                    runs.iter().find_map(|r| {
+                                        let (id, kind) = browse(&r["navigationEndpoint"])?;
+                                        (kind == "MUSIC_PAGE_TYPE_ARTIST").then(|| {
+                                            (
+                                                r["text"].as_str().unwrap_or_default().to_owned(),
+                                                id.to_owned(),
+                                            )
+                                        })
+                                    })
+                                });
+                            let before = page.tracks.len();
+                            walk(child, page);
+                            if let Some((name, id)) = fallback
+                                && !name.trim().is_empty()
+                            {
+                                for track in &mut page.tracks[before..] {
+                                    if track.artist == "Unknown artist" {
+                                        track.artist = name.clone();
+                                        track.artist_id = Some(id.clone());
+                                    }
+                                }
+                            }
+                        }
                         "header" | "title" => {
                             let header = child
                                 .get("musicCarouselShelfBasicHeaderRenderer")
@@ -449,6 +479,50 @@ mod tests {
         assert_eq!(page.tracks[0].duration_seconds, Some(213));
         assert_eq!(page.collections[0].kind, CollectionKind::Album);
         assert_eq!(page.continuation.as_deref(), Some("more"));
+    }
+    #[test]
+    fn card_shelf_songs_inherit_the_card_artist() {
+        let response = json!({"contents": [
+            {"musicCardShelfRenderer": {
+                "title": {"runs": [{"text": "Barış Demirel", "navigationEndpoint": {"browseEndpoint": {"browseId": "UChYM-XrMbGeSjpPzIHE9u4Q", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}}}]},
+                "contents": [
+                    {"musicResponsiveListItemRenderer": {"playlistItemData": {"videoId": "UkdRteW30g0"}, "flexColumns": [
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Uyku Yok"}]}}},
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Song"}, {"text": " • "}, {"text": "4:10"}]}}}]}},
+                    {"musicResponsiveListItemRenderer": {"playlistItemData": {"videoId": "-sfRUF916jA"}, "flexColumns": [
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Ağlamak İstiyorum"}]}}},
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Song"}, {"text": " • "}, {"text": "Barış Demirel", "navigationEndpoint": {"browseEndpoint": {"browseId": "UChYM-XrMbGeSjpPzIHE9u4Q", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}}}]}}}]}},
+                ],
+            }},
+        ]});
+        let page = parse_page(&response);
+        assert_eq!(page.tracks.len(), 2);
+        assert_eq!(page.tracks[0].title, "Uyku Yok");
+        assert_eq!(page.tracks[0].artist, "Barış Demirel");
+        assert_eq!(
+            page.tracks[0].artist_id.as_deref(),
+            Some("UChYM-XrMbGeSjpPzIHE9u4Q")
+        );
+        assert_eq!(page.tracks[0].duration_seconds, Some(250));
+        assert_eq!(page.tracks[1].artist, "Barış Demirel");
+        assert_eq!(
+            page.tracks[1].artist_id.as_deref(),
+            Some("UChYM-XrMbGeSjpPzIHE9u4Q")
+        );
+    }
+    #[test]
+    fn album_header_artist_comes_from_strapline_text_one() {
+        let response = json!({"contents": [{
+            "musicResponsiveHeaderRenderer": {
+                "title": {"runs": [{"text": "The Dark Side of the Moon"}]},
+                "subtitle": {"runs": [{"text": "Album"}, {"text": " • "}, {"text": "1973"}]},
+                "straplineTextOne": {"runs": [{"text": "Pink Floyd", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCO6LS_5W7vqG9mALDNzSFug", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}}}]},
+            },
+        }]});
+        assert_eq!(
+            header_artist(&response),
+            Some(("Pink Floyd", "UCO6LS_5W7vqG9mALDNzSFug"))
+        );
     }
     #[test]
     #[ignore = "requires live YouTube Music access"]

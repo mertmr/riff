@@ -13,6 +13,18 @@ pub(crate) struct ChildProcess {
     job: std::os::windows::io::OwnedHandle,
 }
 impl ChildProcess {
+    pub fn spawn_player(command: &mut Command) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            // mpv quits when this inherited IPC pipe reaches EOF. Only Riff
+            // owns its write end, so even SIGKILL closes it without Drop running.
+            command
+                .arg("--input-ipc-client=fd://0")
+                .stdin(std::process::Stdio::piped());
+        }
+        Self::spawn(command)
+    }
+
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -116,10 +128,121 @@ impl Drop for ChildProcess {
 mod tests {
     use super::*;
     use std::{
-        io::{BufRead, BufReader},
+        io::{BufRead, BufReader, Read, Write},
         process::Stdio,
         time::{Duration, Instant},
     };
+    #[test]
+    #[ignore = "subprocess fixture for the forced-parent-exit test"]
+    fn player_owner_subprocess() {
+        if std::env::var_os("RIFF_TEST_PLAYER_OWNER").is_none() {
+            return;
+        }
+        let player = ChildProcess::spawn_player(
+            Command::new("mpv")
+                .args([
+                    "--no-config",
+                    "--no-terminal",
+                    "--no-video",
+                    "--idle=yes",
+                    "--ao=null",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
+        println!("riff-owned-player: {}", player.id());
+        io::stdout().flush().unwrap();
+        let _ = io::stdin().read(&mut [0]);
+        drop(player);
+    }
+    #[test]
+    #[ignore = "requires mpv; forcibly kills its Rust owner without running Drop"]
+    fn force_killing_the_owner_also_stops_the_player() {
+        let mut owner = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "player::process::tests::player_owner_subprocess",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RIFF_TEST_PLAYER_OWNER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(owner.stdout.take().unwrap());
+        let mut line = String::new();
+        let pid = loop {
+            line.clear();
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "owner exited before spawning mpv"
+            );
+            if let Some((_, pid)) = line.split_once("riff-owned-player:") {
+                break pid.trim().parse::<i32>().unwrap();
+            }
+        };
+        // Allow mpv to initialize while its parent is alive, then reproduce a
+        // force quit. SIGKILL cannot run the owner's Rust shutdown or Drop code.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        let started = Instant::now();
+        let exited = loop {
+            let status = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let status = String::from_utf8_lossy(&status.stdout);
+            if status.trim().is_empty() || status.trim().starts_with('Z') {
+                break true;
+            }
+            if started.elapsed() >= Duration::from_secs(3) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if !exited {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(exited, "mpv survived force-killing its owner");
+    }
+    #[test]
+    #[ignore = "requires mpv; checks the parent-owned IPC lifetime pipe"]
+    fn player_exits_when_its_lifetime_pipe_closes() {
+        let mut player = ChildProcess::spawn_player(
+            Command::new("mpv")
+                .args([
+                    "--no-config",
+                    "--no-terminal",
+                    "--no-video",
+                    "--idle=yes",
+                    "--ao=null",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            player.try_wait().unwrap().is_none(),
+            "the lifetime pipe must keep the player alive"
+        );
+        drop(player.stdin.take());
+        let started = Instant::now();
+        while player.try_wait().unwrap().is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "mpv survived the closed lifetime pipe"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     #[test]
     fn cancellation_reaps_parent_and_stops_extractor_descendants() {
         let mut process = ChildProcess::spawn(
