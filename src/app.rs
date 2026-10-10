@@ -246,6 +246,7 @@ pub struct MusicApp {
     pub search_done: bool,
     pub playback: Playback,
     pub buffering: bool,
+    pub playback_paused: bool,
     pub position: f64,
     pub duration: Option<f64>,
     pub seekable: bool,
@@ -413,6 +414,7 @@ impl MusicApp {
             search_done: false,
             playback: Playback::Empty,
             buffering: false,
+            playback_paused: false,
             position: 0.,
             duration: None,
             seekable: false,
@@ -710,6 +712,7 @@ impl MusicApp {
         self.generation = self.generation.wrapping_add(1);
         self.current = Some(track);
         self.playback = Playback::Loading;
+        self.playback_paused = false;
         self.buffering = false;
         self.position = 0.;
         self.duration = None;
@@ -754,6 +757,9 @@ impl MusicApp {
         {
             // A queue edit crossed the native handoff. Replace stale audio with
             // the current queue choice without consuming the removed occurrence.
+            // Skip the native entry's generation so its cached metadata cannot
+            // be mistaken for the replacement track's playback events.
+            self.generation = self.generation.wrapping_add(1);
             self.next();
             return;
         }
@@ -984,7 +990,11 @@ impl MusicApp {
                     self.playback_error = None;
                 }
                 PlaybackEvent::Ready => {
-                    self.playback = Playback::Playing;
+                    self.playback = if self.playback_paused {
+                        Playback::Paused
+                    } else {
+                        Playback::Playing
+                    };
                     self.buffering = false;
                     if let Some(track) = &self.current {
                         self.recent.retain(|t| t.id != track.id);
@@ -995,6 +1005,7 @@ impl MusicApp {
                     }
                 }
                 PlaybackEvent::Paused(paused) => {
+                    self.playback_paused = paused;
                     if matches!(self.playback, Playback::Playing | Playback::Paused) {
                         self.playback = if paused {
                             Playback::Paused
@@ -1144,10 +1155,22 @@ impl MusicApp {
                 self.refill_radio();
             }
             Action::TogglePlayback => match self.playback {
-                Playback::Playing | Playback::Paused => {
+                Playback::Loading | Playback::Playing | Playback::Paused => {
+                    self.playback_paused = if self.playback == Playback::Loading {
+                        !self.playback_paused
+                    } else {
+                        self.playback != Playback::Paused
+                    };
+                    if self.playback != Playback::Loading {
+                        self.playback = if self.playback_paused {
+                            Playback::Paused
+                        } else {
+                            Playback::Playing
+                        };
+                    }
                     let _ = self
                         .player_tx
-                        .send(PlayerCommand::SetPaused(self.playback != Playback::Paused));
+                        .send(PlayerCommand::SetPaused(self.playback_paused));
                 }
                 Playback::Stopped | Playback::Error => {
                     if let Some(t) = self.current.clone() {
@@ -1533,6 +1556,9 @@ impl MusicApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
             self.dispatch(Action::TogglePlayback, ctx);
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Period)) {
+            self.dispatch(Action::Stop, ctx);
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::J)) {
             self.queue_open = !self.queue_open;
         }
@@ -1637,8 +1663,7 @@ impl eframe::App for MusicApp {
         ui::show(self, ui);
         // Workers wake the UI when something changes. An idle or paused player
         // has no periodic redraw; controls still repaint immediately on input.
-        if matches!(self.playback, Playback::Loading)
-            || self.searching
+        if self.searching
             || self.recommendations.searching
             || self.radio.as_ref().is_some_and(|r| r.searching)
         {
@@ -2158,6 +2183,55 @@ mod tests {
         );
     }
     #[test]
+    fn native_radio_handoff_keeps_manual_priority_and_continuation() {
+        let (mut app, commands, events, ctx) = fixture();
+        let (tx, _jobs) = mpsc::channel();
+        app.radio_tx = tx;
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        let c = track("JGwWNGJdvx8");
+        app.dispatch(Action::StartRadio(a.clone()), &ctx);
+        commands.recv().unwrap();
+        app.radio.as_mut().unwrap().upcoming.push_back(c.clone());
+        app.dispatch(Action::Enqueue(b.clone(), false), &ctx);
+        for expected in [b.clone(), c.clone()] {
+            let PlayerCommand::PrepareNext {
+                generation,
+                revision,
+                track: Some(prepared),
+            } = commands.recv().unwrap()
+            else {
+                panic!("missing radio prefetch")
+            };
+            assert_eq!(prepared, expected);
+            events
+                .send(PlayerEvent {
+                    generation,
+                    event: PlaybackEvent::Transition {
+                        track: expected.clone(),
+                        revision,
+                    },
+                })
+                .unwrap();
+            events
+                .send(PlayerEvent {
+                    generation: generation.wrapping_add(1),
+                    event: PlaybackEvent::Ready,
+                })
+                .unwrap();
+            app.receive();
+            assert_eq!(app.current, Some(expected.clone()));
+            assert_eq!(
+                app.radio.as_ref().unwrap().continuation,
+                if expected == b { a.clone() } else { c.clone() }
+            );
+        }
+        assert_eq!(app.history, vec![a, b]);
+        assert!(app.queue.is_empty());
+        assert!(app.radio.as_ref().unwrap().upcoming.is_empty());
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
     fn queue_edit_crossing_handoff_plays_the_current_choice() {
         let (mut app, commands, events, ctx) = fixture();
         let a = track("dQw4w9WgXcQ");
@@ -2189,6 +2263,22 @@ mod tests {
         assert!(
             matches!(commands.recv().unwrap(), PlayerCommand::Play { track, .. } if track == c)
         );
+        for event in [
+            PlaybackEvent::Ready,
+            PlaybackEvent::Duration(383.),
+            PlaybackEvent::Position(4.),
+        ] {
+            events
+                .send(PlayerEvent {
+                    generation: generation.wrapping_add(1),
+                    event,
+                })
+                .unwrap();
+        }
+        app.receive();
+        assert_eq!(app.playback, Playback::Loading);
+        assert_eq!(app.duration, None);
+        assert_eq!(app.position, 0.);
         app.dispatch(Action::Stop, &ctx);
         events
             .send(PlayerEvent {
@@ -2198,6 +2288,89 @@ mod tests {
             .unwrap();
         app.receive();
         assert_eq!(app.playback, Playback::Stopped);
+    }
+    #[test]
+    fn playback_preparation_is_hidden_and_pause_remains_available() {
+        let (mut app, commands, events, ctx) = fixture();
+        ctx.enable_accesskit();
+        app.dispatch(Action::Play(track("Eq8ZiZ9xiLw")), &ctx);
+        commands.try_iter().for_each(drop);
+        let render = |app: &mut MusicApp| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280., 800.),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::ui::show(app, ui);
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        for recovering in [false, true] {
+            if recovering {
+                events
+                    .send(PlayerEvent {
+                        generation: app.generation,
+                        event: PlaybackEvent::Recovering,
+                    })
+                    .unwrap();
+                app.receive();
+            }
+            let output = render(&mut app);
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes;
+            assert!(
+                nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some("Pause · Space") && !node.is_disabled())
+            );
+            let text = format!("{:?}", output.shapes);
+            for hidden in [
+                "Loading audio",
+                "Cancel loading",
+                "Reconnecting",
+                "Buffering",
+            ] {
+                assert!(!text.contains(hidden));
+            }
+            app.dispatch(Action::TogglePlayback, &ctx);
+            assert!(matches!(
+                commands.recv().unwrap(),
+                PlayerCommand::SetPaused(true)
+            ));
+            let output = render(&mut app);
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some("Play · Space") && !node.is_disabled())
+            );
+            events
+                .send(PlayerEvent {
+                    generation: app.generation,
+                    event: PlaybackEvent::Ready,
+                })
+                .unwrap();
+            app.receive();
+            assert_eq!(app.playback, Playback::Paused);
+            app.dispatch(Action::TogglePlayback, &ctx);
+            assert!(matches!(
+                commands.recv().unwrap(),
+                PlayerCommand::SetPaused(false)
+            ));
+        }
     }
     #[test]
     fn recovery_preserves_queue_and_position_then_restores_pause() {

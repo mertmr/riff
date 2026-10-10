@@ -111,3 +111,48 @@ impl Drop for ChildProcess {
         let _ = self.child.wait();
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    #[test]
+    fn cancellation_reaps_parent_and_stops_extractor_descendants() {
+        let mut process = ChildProcess::spawn(
+            Command::new("sh")
+                .args(["-c", "sleep 30 & printf '%s\\n' \"$!\"; wait"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
+        let mut pid = String::new();
+        BufReader::new(process.stdout.take().unwrap())
+            .read_line(&mut pid)
+            .unwrap();
+        let descendant: i32 = pid.trim().parse().unwrap();
+        let parent = process.id() as i32;
+        assert_eq!(unsafe { libc::getpgid(descendant) }, parent);
+        drop(process);
+        assert_eq!(unsafe { libc::kill(parent, 0) }, -1);
+        let started = Instant::now();
+        loop {
+            let status = Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .unwrap();
+            let status = String::from_utf8_lossy(&status.stdout);
+            if status.trim().is_empty() || status.trim().starts_with('Z') {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "extractor descendant survived cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

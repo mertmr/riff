@@ -53,18 +53,12 @@ fn now_playing(app: &mut MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Actio
             12.,
             MUTED,
         );
-        let status = if app.buffering && app.playback == Playback::Loading {
-            "Reconnecting audio…"
-        } else if app.buffering {
-            "Buffering…"
-        } else {
-            match app.playback {
-                Playback::Loading => "Loading audio…",
-                Playback::Paused => "Paused",
-                Playback::Error => "Couldn't play · Retry",
-                Playback::Stopped => "Playback stopped",
-                _ => "Now playing",
-            }
+        let status = match app.playback {
+            Playback::Paused => "Paused",
+            Playback::Loading if app.playback_paused => "Paused",
+            Playback::Error => "Couldn't play · Retry",
+            Playback::Stopped => "Playback stopped",
+            _ => "Now playing",
         };
         let status_rect = Rect::from_min_size(pos2(text_x, r.center().y + 15.), vec2(width, 20.));
         widgets::text(
@@ -168,37 +162,27 @@ fn transport(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
     {
         actions.push(Action::Previous);
     }
-    let loading = app.playback == Playback::Loading;
+    let playing = app.playback == Playback::Playing
+        || (app.playback == Playback::Loading && !app.playback_paused);
     if widgets::icon_button(
         ui,
         "play_pause",
         play,
-        if app.playback == Playback::Playing {
-            Icon::Pause
-        } else {
-            Icon::Play
-        },
+        if playing { Icon::Pause } else { Icon::Play },
         if app.playback == Playback::Error {
             "Retry playback"
-        } else if app.playback == Playback::Playing {
+        } else if playing {
             "Pause · Space"
         } else {
             "Play · Space"
         },
         false,
-        app.current.is_some() && !loading,
+        app.current.is_some(),
         true,
     )
     .clicked()
     {
         actions.push(Action::TogglePlayback);
-    }
-    if loading {
-        ui.painter().circle_filled(play.center(), 20., SURFACE);
-        egui::Spinner::new()
-            .size(18.)
-            .color(ACCENT)
-            .paint_at(ui, play.shrink(10.));
     }
     if widgets::icon_button(
         ui,
@@ -335,22 +319,4 @@ fn extras(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
         10.,
         DIM,
     );
-    if app.buffering && app.playback != Playback::Loading {
-        widgets::text(
-            ui,
-            Rect::from_min_size(pos2(r.left(), r.top() + 10.), vec2(r.width(), 16.)),
-            "Buffering audio…",
-            10.,
-            ACCENT,
-        );
-    }
-    // A stop command is useful during slow startup, without adding another transport glyph.
-    if app.playback == Playback::Loading {
-        let stop = Rect::from_min_size(pos2(r.left(), r.top() + 10.), vec2(104., 20.));
-        let response = ui.interact(stop, ui.id().with("cancel_playback"), Sense::click());
-        widgets::text(ui, stop, "Cancel loading", 10., MUTED);
-        if response.clicked() {
-            actions.push(Action::Stop);
-        }
-    }
 }

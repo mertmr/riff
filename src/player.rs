@@ -84,10 +84,29 @@ impl Connection {
             s
         };
         #[cfg(windows)]
-        let stream = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let stream = {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Pipes::{
+                PIPE_NOWAIT, PIPE_READMODE_BYTE, SetNamedPipeHandleState,
+            };
+            let stream = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?;
+            let mode = PIPE_NOWAIT | PIPE_READMODE_BYTE;
+            if unsafe {
+                SetNamedPipeHandleState(
+                    stream.as_raw_handle(),
+                    &mode,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            stream
+        };
         Ok(Self {
             stream,
             pending: Vec::new(),
@@ -106,7 +125,14 @@ impl Connection {
     fn flush(&mut self) -> std::io::Result<()> {
         while self.written < self.outgoing.len() {
             match self.stream.write(&self.outgoing[self.written..]) {
-                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(0) => {
+                    // A nonblocking Windows byte pipe can accept zero bytes
+                    // when full; keep the unwritten command for the next poll.
+                    #[cfg(windows)]
+                    return Ok(());
+                    #[cfg(not(windows))]
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
                 Ok(n) => self.written += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
@@ -224,6 +250,7 @@ struct Playing {
     seekable: bool,
     retries: u8,
     started: Instant,
+    last_progress: Instant,
     buffering_since: Option<Instant>,
     buffering: bool,
     retry_at: Option<Instant>,
@@ -234,12 +261,18 @@ struct Upcoming {
     entry: Option<i64>,
     attempted: bool,
 }
+struct Handoff {
+    previous: Playing,
+    revision: u64,
+    audio_pts: Option<f64>,
+}
 struct Engine<W: Fn()> {
     process: Option<Child>,
     ipc: Option<String>,
     connection: Option<Connection>,
     current: Option<Playing>,
     next: Option<Upcoming>,
+    handoff: Option<Handoff>,
     resolver: Option<Resolver>,
     bindings: HashMap<i64, Binding>,
     requests: HashMap<u64, Binding>,
@@ -247,6 +280,8 @@ struct Engine<W: Fn()> {
     active_entry: Option<i64>,
     epoch: u64,
     request_id: u64,
+    last_heartbeat: Instant,
+    heartbeat_sent: Option<Instant>,
     volume: u8,
     paused: bool,
     last_position: Instant,
@@ -265,6 +300,7 @@ impl<W: Fn()> Engine<W> {
             connection: None,
             current: None,
             next: None,
+            handoff: None,
             resolver: None,
             bindings: HashMap::new(),
             requests: HashMap::new(),
@@ -272,6 +308,8 @@ impl<W: Fn()> Engine<W> {
             active_entry: None,
             epoch: 0,
             request_id: 1000,
+            last_heartbeat: Instant::now(),
+            heartbeat_sent: None,
             volume: 70,
             paused: false,
             last_position: Instant::now() - Duration::from_secs(1),
@@ -284,6 +322,26 @@ impl<W: Fn()> Engine<W> {
         }
     }
     fn emit(&mut self, generation: u64, event: PlaybackEvent) {
+        let generation = if let Some(handoff) = &self.handoff {
+            if generation == self.generation() {
+                // Decoder metadata belongs to the next file while the output
+                // device is still playing the previous file's buffered tail.
+                if matches!(
+                    event,
+                    PlaybackEvent::Paused(_)
+                        | PlaybackEvent::Volume(_)
+                        | PlaybackEvent::ControlError(_)
+                ) {
+                    handoff.previous.binding.generation
+                } else {
+                    return;
+                }
+            } else {
+                generation
+            }
+        } else {
+            generation
+        };
         if matches!(event, PlaybackEvent::Position(_)) {
             if self.last_position.elapsed() < Duration::from_millis(250) {
                 return;
@@ -296,6 +354,94 @@ impl<W: Fn()> Engine<W> {
     }
     fn generation(&self) -> u64 {
         self.current.as_ref().map_or(0, |c| c.binding.generation)
+    }
+    fn publish_handoff(&mut self) {
+        let Some(handoff) = self.handoff.take() else {
+            return;
+        };
+        let Some(current) = &self.current else { return };
+        let generation = current.binding.generation;
+        let track = current.binding.track.clone();
+        let (ready, position, duration, seekable, buffering) = (
+            current.ready,
+            current.position,
+            current.duration,
+            current.seekable,
+            current.buffering,
+        );
+        self.last_position = Instant::now() - Duration::from_secs(1);
+        self.emit(
+            handoff.previous.binding.generation,
+            PlaybackEvent::Transition {
+                track,
+                revision: handoff.revision,
+            },
+        );
+        if ready {
+            self.emit(generation, PlaybackEvent::Ready);
+        }
+        if let Some(duration) = duration {
+            self.emit(generation, PlaybackEvent::Duration(duration));
+        }
+        self.emit(generation, PlaybackEvent::Seekable(seekable));
+        self.emit(generation, PlaybackEvent::Position(position));
+        self.emit(generation, PlaybackEvent::Buffering(buffering));
+        self.emit(generation, PlaybackEvent::Paused(self.paused));
+    }
+    fn audio_clock(&mut self, pts: f64) {
+        if !pts.is_finite() || self.handoff.is_none() {
+            return;
+        }
+        if pts >= 0. {
+            if let Some(current) = &mut self.current {
+                current.position = pts;
+            }
+            self.publish_handoff();
+        } else if let Some(handoff) = &mut self.handoff {
+            if let Some(previous_pts) = handoff.audio_pts {
+                handoff.previous.position += (pts - previous_pts).max(0.);
+            }
+            handoff.audio_pts = Some(pts);
+            let generation = handoff.previous.binding.generation;
+            let position = handoff.previous.position;
+            self.emit(generation, PlaybackEvent::Position(position));
+        }
+    }
+    fn restore_audible_track(&mut self, position: Option<f64>) -> bool {
+        let Some(handoff) = self.handoff.take() else {
+            return false;
+        };
+        let Some(decoded) = self.current.take() else {
+            return false;
+        };
+        self.epoch = self.epoch.wrapping_add(1);
+        self.resolver = None;
+        self.bindings.clear();
+        self.requests.clear();
+        self.messages.clear();
+        self.active_entry = None;
+        let mut previous = handoff.previous;
+        previous.binding.epoch = self.epoch;
+        previous.entry = None;
+        previous.ready = false;
+        previous.awaiting_next = false;
+        previous.started = Instant::now();
+        previous.last_progress = Instant::now();
+        if let Some(position) = position {
+            previous.position = position.max(0.);
+        }
+        let parent = previous.binding.generation;
+        let mut binding = decoded.binding;
+        binding.epoch = self.epoch;
+        binding.transition = Some((parent, handoff.revision));
+        self.next = Some(Upcoming {
+            binding,
+            media: None,
+            entry: None,
+            attempted: false,
+        });
+        self.current = Some(previous);
+        true
     }
     fn send(&mut self, command: Value) -> std::io::Result<()> {
         if let Some(connection) = &mut self.connection {
@@ -311,6 +457,7 @@ impl<W: Fn()> Engine<W> {
         self.requests.clear();
         self.messages.clear();
         self.active_entry = None;
+        self.heartbeat_sent = None;
     }
     fn clear_next(&mut self) {
         self.resolver = None; // Drop kills and reaps cancelled extraction immediately.
@@ -327,12 +474,14 @@ impl<W: Fn()> Engine<W> {
     fn handle(&mut self, command: PlayerCommand) -> bool {
         match command {
             PlayerCommand::Play { track, generation } => {
+                self.handoff = None;
                 self.clear_next();
                 self.epoch = self.epoch.wrapping_add(1);
                 self.requests.clear();
                 self.bindings.clear();
                 self.messages.clear();
                 self.active_entry = None;
+                self.last_position = Instant::now() - Duration::from_secs(1);
                 self.paused = false;
                 self.current = Some(Playing {
                     binding: Binding {
@@ -350,6 +499,7 @@ impl<W: Fn()> Engine<W> {
                     seekable: false,
                     retries: 0,
                     started: Instant::now(),
+                    last_progress: Instant::now(),
                     buffering_since: None,
                     buffering: false,
                     retry_at: None,
@@ -393,6 +543,7 @@ impl<W: Fn()> Engine<W> {
                 self.paused = value;
                 if let Some(current) = &mut self.current {
                     current.buffering_since = (current.buffering && !value).then(Instant::now);
+                    current.last_progress = Instant::now();
                 }
                 self.control(json!(["set_property", "pause", value]));
             }
@@ -401,8 +552,13 @@ impl<W: Fn()> Engine<W> {
                 self.control(json!(["set_property", "volume", self.volume]));
             }
             PlayerCommand::Seek(position) if position.is_finite() => {
+                if self.restore_audible_track(Some(position)) {
+                    self.load_current();
+                    return true;
+                }
                 if let Some(current) = &mut self.current {
                     current.position = position.max(0.);
+                    current.last_progress = Instant::now();
                     current.buffering_since =
                         (current.buffering && !self.paused).then(Instant::now);
                 }
@@ -415,6 +571,7 @@ impl<W: Fn()> Engine<W> {
                 self.resolver = None;
                 self.next = None;
                 self.current = None;
+                self.handoff = None;
                 self.disconnect();
                 if shutdown {
                     return false;
@@ -526,6 +683,7 @@ impl<W: Fn()> Engine<W> {
         }
     }
     fn finish_error(&mut self, error: String) {
+        self.restore_audible_track(None);
         let generation = self.generation();
         if let Some(current) = &mut self.current {
             if current.ended {
@@ -543,6 +701,7 @@ impl<W: Fn()> Engine<W> {
         );
     }
     fn fail(&mut self, error: String) {
+        self.restore_audible_track(None);
         let Some(current) = &mut self.current else {
             self.disconnect();
             return;
@@ -593,14 +752,9 @@ impl<W: Fn()> Engine<W> {
                         .unwrap_or("missing playlist ID; update mpv")
                 ));
             } else {
+                // Preparation is optional; EOF advances through the normal
+                // queue path without surfacing a background extraction failure.
                 self.next = None;
-                self.emit(
-                    self.generation(),
-                    PlaybackEvent::ControlError(
-                        "Couldn't prepare seamless playback; the next track will load normally."
-                            .into(),
-                    ),
-                );
             }
             return;
         };
@@ -640,9 +794,9 @@ impl<W: Fn()> Engine<W> {
                 }
                 self.resolver = None;
                 self.next = None;
-                let track = binding.track.clone();
                 let mut binding = binding;
                 binding.transition = None;
+                let previous = self.current.take().unwrap();
                 self.current = Some(Playing {
                     binding,
                     entry: self.active_entry,
@@ -654,18 +808,31 @@ impl<W: Fn()> Engine<W> {
                     seekable: false,
                     retries: 0,
                     started: Instant::now(),
+                    last_progress: Instant::now(),
                     buffering_since: None,
                     buffering: false,
                     retry_at: None,
                 });
                 self.last_position = Instant::now() - Duration::from_secs(1);
-                self.emit(parent, PlaybackEvent::Transition { track, revision });
+                self.handoff = Some(Handoff {
+                    previous,
+                    revision,
+                    audio_pts: None,
+                });
             }
             return;
         }
         if message["request_id"] == 100 {
             if let Some(event) = parse_message(&message) {
                 self.emit(self.generation(), event);
+            }
+            return;
+        }
+        if message["event"] == "property-change" && message["name"] == "idle-active" {
+            if message["data"] == true && self.current.as_ref().is_some_and(|c| c.awaiting_next) {
+                // mpv enters idle only after draining the last file's output.
+                self.publish_handoff();
+                self.end();
             }
             return;
         }
@@ -678,6 +845,12 @@ impl<W: Fn()> Engine<W> {
                 return;
             }
         } else if self.active_entry != current.entry || current.entry.is_none() {
+            return;
+        }
+        if message["event"] == "property-change" && message["name"] == "audio-pts" {
+            if let Some(pts) = message["data"].as_f64() {
+                self.audio_clock(pts);
+            }
             return;
         }
         let Some(event) = parse_message(&message) else {
@@ -694,22 +867,21 @@ impl<W: Fn()> Engine<W> {
                     current.duration,
                 ) {
                     self.fail("The audio connection ended before the track finished.".into());
-                } else if self.next.as_ref().is_some_and(|n| n.entry.is_some()) {
-                    // mpv owns the handoff; emitting Ended here would make the UI
-                    // replace the already-prefetched playlist and reopen the stream.
+                } else {
+                    // Decoder EOF precedes audible EOF. Wait for the next
+                    // audio clock, or idle after mpv drains the final output.
                     if let Some(current) = &mut self.current {
                         current.started = Instant::now();
                         current.ready = false;
                         current.awaiting_next = true;
                     }
-                } else {
-                    self.end();
                 }
             }
             PlaybackEvent::Ready => {
                 if let Some(current) = &mut self.current {
                     current.buffering = false;
                     current.ready = true;
+                    current.last_progress = Instant::now();
                     current.buffering_since = None;
                 }
                 self.emit(self.generation(), PlaybackEvent::Ready);
@@ -719,6 +891,9 @@ impl<W: Fn()> Engine<W> {
             }
             PlaybackEvent::Position(position) => {
                 if let Some(current) = &mut self.current {
+                    if (current.position - position).abs() > 0.001 {
+                        current.last_progress = Instant::now();
+                    }
                     current.position = position;
                 }
                 self.emit(self.generation(), PlaybackEvent::Position(position));
@@ -776,6 +951,7 @@ impl<W: Fn()> Engine<W> {
             && let Ok(connection) = Connection::open(path)
         {
             self.connection = Some(connection);
+            self.last_heartbeat = Instant::now();
             for (i, property) in [
                 "time-pos",
                 "duration",
@@ -783,6 +959,8 @@ impl<W: Fn()> Engine<W> {
                 "paused-for-cache",
                 "seekable",
                 "volume",
+                "audio-pts",
+                "idle-active",
             ]
             .iter()
             .enumerate()
@@ -801,6 +979,9 @@ impl<W: Fn()> Engine<W> {
                     // Replies can arrive after start-file. Bind IDs before replaying
                     // that batch; hold events if an earlier load reply is still pending.
                     for message in &messages {
+                        if message["request_id"] == 101 {
+                            self.heartbeat_sent = None;
+                        }
                         self.accept_reply(message);
                     }
                     self.messages.extend(
@@ -827,6 +1008,24 @@ impl<W: Fn()> Engine<W> {
                 Err(error) => self.fail(format!("Lost contact with the player: {error}")),
             }
         }
+        if self.connection.is_some() {
+            if self
+                .heartbeat_sent
+                .is_some_and(|sent| sent.elapsed() > Duration::from_secs(10))
+            {
+                self.fail("The audio player stopped responding.".into());
+            } else if self.heartbeat_sent.is_none()
+                && self.last_heartbeat.elapsed() > Duration::from_secs(5)
+            {
+                self.last_heartbeat = Instant::now();
+                self.heartbeat_sent = Some(Instant::now());
+                if let Err(error) =
+                    self.send(json!({"command":["get_property","pause"],"request_id":101}))
+                {
+                    self.fail(format!("Lost contact with the player: {error}"));
+                }
+            }
+        }
         if let Some(child) = &mut self.process {
             match child.try_wait() {
                 Ok(Some(_)) => self.fail("The audio player exited unexpectedly.".into()),
@@ -836,10 +1035,7 @@ impl<W: Fn()> Engine<W> {
         }
         if let Some(current) = &self.current {
             if !current.ended && current.retry_at.is_none() {
-                if current.awaiting_next && current.started.elapsed() > Duration::from_secs(5) {
-                    self.control(json!(["stop"]));
-                    self.end();
-                } else if !current.ready && current.started.elapsed() > Duration::from_secs(45) {
+                if !current.ready && current.started.elapsed() > Duration::from_secs(45) {
                     self.fail("This track took too long to load. Check your connection.".into());
                 } else if !self.paused
                     && current
@@ -847,6 +1043,12 @@ impl<W: Fn()> Engine<W> {
                         .is_some_and(|s| s.elapsed() > Duration::from_secs(60))
                 {
                     self.fail("The audio connection stalled.".into());
+                } else if current.ready
+                    && !self.paused
+                    && !current.buffering
+                    && current.last_progress.elapsed() > Duration::from_secs(30)
+                {
+                    self.fail("Audio playback stopped making progress.".into());
                 }
             } else if current.ended
                 && self.process.is_some()
@@ -880,7 +1082,15 @@ impl<W: Fn()> Drop for Engine<W> {
     }
 }
 fn premature_eof(ready: bool, seekable: bool, position: f64, duration: Option<f64>) -> bool {
-    ready && seekable && duration.is_some_and(|duration| position + 2. < duration)
+    // Stream duration is an estimate and may include a video-only tail. mpv's
+    // last observed position can also precede EOF. Retry substantial truncation,
+    // but let normal endings hand off to the already prepared playlist entry.
+    ready
+        && seekable
+        && duration.is_some_and(|duration| {
+            let tolerance = (duration * 0.02).clamp(5., 10.);
+            position + tolerance < duration
+        })
 }
 fn run_engine<W: Fn()>(commands: Receiver<PlayerCommand>, mut engine: Engine<W>) {
     loop {
@@ -1033,8 +1243,128 @@ mod tests {
     fn truncated_seekable_streams_are_retried_but_live_and_finished_streams_end() {
         assert!(premature_eof(true, true, 10., Some(180.)));
         assert!(!premature_eof(true, true, 179.8, Some(180.)));
+        assert!(!premature_eof(true, true, 304.185527, Some(307.)));
+        assert!(premature_eof(true, true, 290., Some(307.)));
         assert!(!premature_eof(true, false, 10., Some(180.)));
         assert!(!premature_eof(true, true, 10., None));
+    }
+    fn pending_handoff() -> (Engine<fn()>, Receiver<PlayerEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let mut engine: Engine<fn()> = Engine::new(tx, || {});
+        engine.handle(PlayerCommand::Play {
+            track: Track::default(),
+            generation: 12,
+        });
+        engine.handle(PlayerCommand::PrepareNext {
+            track: Some(Track {
+                id: "next".into(),
+                ..Default::default()
+            }),
+            generation: 12,
+            revision: 42,
+        });
+        let current = engine.current.as_mut().unwrap();
+        current.ready = true;
+        current.seekable = true;
+        current.position = 304.185527;
+        current.duration = Some(307.);
+        current.entry = Some(1);
+        let next = engine.next.as_mut().unwrap();
+        next.entry = Some(2);
+        engine.bindings.insert(2, next.binding.clone());
+        engine.active_entry = Some(1);
+        engine.message(json!({"event":"end-file", "reason":"eof", "playlist_entry_id":1}));
+        assert!(engine.current.as_ref().unwrap().awaiting_next);
+        engine.message(json!({"event":"start-file", "playlist_entry_id":2}));
+        engine.message(json!({"event":"file-loaded"}));
+        assert_eq!(engine.generation(), 13);
+        (engine, rx)
+    }
+    #[test]
+    fn estimated_duration_tail_hands_off_at_the_audible_boundary() {
+        let (mut engine, rx) = pending_handoff();
+        engine.message(json!({"event":"property-change", "name":"duration", "data":383.}));
+        engine.message(json!({"event":"property-change", "name":"audio-pts", "data":-3.}));
+        engine.message(json!({"event":"property-change", "name":"audio-pts", "data":-1.}));
+        let waiting: Vec<_> = rx.try_iter().collect();
+        assert!(waiting.iter().all(|e| e.generation == 12
+            && matches!(
+                e.event,
+                PlaybackEvent::Position(_) | PlaybackEvent::Paused(_)
+            )));
+        assert!((engine.handoff.as_ref().unwrap().previous.position - 306.185527).abs() < 0.001);
+        engine.message(json!({"event":"property-change", "name":"audio-pts", "data":null}));
+        assert!(engine.handoff.is_some());
+        engine.message(json!({"event":"property-change", "name":"audio-pts", "data":0.01}));
+        assert!(engine.handoff.is_none());
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            events[0].event,
+            PlaybackEvent::Transition { revision: 42, .. }
+        ));
+        assert_eq!(events[0].generation, 12);
+        assert!(events[1..].iter().all(|e| e.generation == 13));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, PlaybackEvent::Duration(383.)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.event, PlaybackEvent::Transition { revision: 42, .. }))
+        );
+        assert!(events.iter().all(|e| !matches!(
+            e.event,
+            PlaybackEvent::Recovering | PlaybackEvent::Ended | PlaybackEvent::Error(_)
+        )));
+    }
+    #[test]
+    fn seeking_or_recovering_during_the_tail_keeps_the_audible_track() {
+        for seek in [false, true] {
+            let (mut engine, rx) = pending_handoff();
+            if seek {
+                engine.handle(PlayerCommand::Seek(37.));
+                assert_eq!(engine.current.as_ref().unwrap().position, 37.);
+            } else {
+                engine.fail("disconnected".into());
+                assert!(rx.try_iter().any(|e| e.generation == 12 && matches!(e.event, PlaybackEvent::Recovering)));
+            }
+            assert_eq!(engine.generation(), 12);
+            assert_eq!(
+                engine.current.as_ref().unwrap().binding.track,
+                Track::default()
+            );
+            assert_eq!(
+                engine.next.as_ref().unwrap().binding.transition,
+                Some((12, 42))
+            );
+            assert!(engine.handoff.is_none());
+            assert!(
+                rx.try_iter()
+                    .all(|e| !matches!(e.event, PlaybackEvent::Transition { .. }))
+            );
+        }
+    }
+    #[test]
+    fn replacing_or_stopping_discards_an_inaudible_handoff() {
+        for stop in [false, true] {
+            let (mut engine, rx) = pending_handoff();
+            engine.handle(if stop {
+                PlayerCommand::Stop
+            } else {
+                PlayerCommand::Play {
+                    track: Track::default(),
+                    generation: 20,
+                }
+            });
+            engine.audio_clock(1.);
+            assert!(engine.handoff.is_none());
+            assert!(
+                rx.try_iter()
+                    .all(|e| !matches!(e.event, PlaybackEvent::Transition { .. }))
+            );
+        }
     }
     #[test]
     fn stop_cancels_pending_recovery_and_retry_budget_is_bounded() {
@@ -1215,6 +1545,14 @@ mod integration_tests {
     #[test]
     #[ignore = "requires mpv, yt-dlp and live YouTube access"]
     fn mpv_live_youtube_prefetch_and_native_handoff() {
+        live_youtube_handoff("dQw4w9WgXcQ", "hTWKbfoikeg", 1.);
+    }
+    #[test]
+    #[ignore = "requires mpv, yt-dlp and live YouTube access"]
+    fn mpv_live_album_tail_handoff() {
+        live_youtube_handoff("Eq8ZiZ9xiLw", "-0kcet4aPpQ", 6.);
+    }
+    fn live_youtube_handoff(first: &str, second: &str, tail: f64) {
         let (tx, events) = mpsc::channel();
         let mut engine = Engine::new(tx, || {});
         engine.command = || {
@@ -1223,11 +1561,11 @@ mod integration_tests {
             command
         };
         let a = Track {
-            id: "dQw4w9WgXcQ".into(),
+            id: first.into(),
             ..Default::default()
         };
         let b = Track {
-            id: "hTWKbfoikeg".into(),
+            id: second.into(),
             ..Default::default()
         };
         engine.handle(PlayerCommand::Play {
@@ -1263,7 +1601,7 @@ mod integration_tests {
         }
         let pid = engine.process.as_ref().unwrap().id();
         let duration = engine.current.as_ref().unwrap().duration.unwrap();
-        engine.handle(PlayerCommand::Seek(duration - 1.));
+        engine.handle(PlayerCommand::Seek(duration - tail));
         // Seeking ahead lets mpv finish reading this stream and open the next
         // one while its buffered tail is still playing.
         for _ in 0..40 {
@@ -1272,7 +1610,9 @@ mod integration_tests {
         }
         engine.handle(PlayerCommand::SetPaused(false));
         drive(&mut engine, |e| {
-            e.generation() == 101 && e.current.as_ref().is_some_and(|c| c.ready)
+            e.generation() == 101
+                && e.handoff.is_none()
+                && e.current.as_ref().is_some_and(|c| c.ready)
         });
         assert_eq!(engine.process.as_ref().unwrap().id(), pid);
         assert_eq!(engine.current.as_ref().unwrap().binding.track, b);
@@ -1291,6 +1631,151 @@ mod integration_tests {
                 | PlaybackEvent::Recovering
                 | PlaybackEvent::ControlError(_)
         )));
+    }
+    #[test]
+    #[ignore = "requires mpv; verifies UI handoff timing with a large output buffer"]
+    fn mpv_handoff_waits_for_output_clock_and_preserves_paused_tail() {
+        let a = AudioFile::wav(6, 1000);
+        let b = AudioFile::wav(10, -2000);
+        let (mut engine, events) = local_engine();
+        engine.extra_args.push("--audio-buffer=3".into());
+        engine.handle(PlayerCommand::Play {
+            track: a.track(),
+            generation: 10,
+        });
+        engine.handle(PlayerCommand::SetPaused(true));
+        engine.handle(PlayerCommand::PrepareNext {
+            track: Some(b.track()),
+            generation: 10,
+            revision: 7,
+        });
+        drive(&mut engine, |e| {
+            e.current.as_ref().is_some_and(|c| c.ready)
+                && e.next.as_ref().is_some_and(|n| n.entry.is_some())
+        });
+        events.try_iter().for_each(drop);
+        let started = Instant::now();
+        engine.handle(PlayerCommand::SetPaused(false));
+        drive(&mut engine, |e| {
+            e.handoff
+                .as_ref()
+                .is_some_and(|h| h.audio_pts.is_some_and(|p| p < -1.))
+        });
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            events
+                .try_iter()
+                .all(|e| !matches!(e.event, PlaybackEvent::Transition { .. }))
+        );
+        engine.handle(PlayerCommand::SetPaused(true));
+        let paused_at = Instant::now();
+        while paused_at.elapsed() < Duration::from_millis(400) {
+            engine.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(engine.handoff.is_some());
+        assert!(
+            events
+                .try_iter()
+                .all(|e| !matches!(e.event, PlaybackEvent::Transition { .. }))
+        );
+        let paused_for = paused_at.elapsed();
+        engine.handle(PlayerCommand::SetPaused(false));
+        drive(&mut engine, |e| e.handoff.is_none());
+        let audible_time = started.elapsed() - paused_for;
+        assert!(
+            audible_time >= Duration::from_millis(5700),
+            "early UI handoff at {audible_time:?}"
+        );
+        assert!(
+            audible_time < Duration::from_millis(6700),
+            "late UI handoff at {audible_time:?}"
+        );
+        let transitions: Vec<_> = events
+            .try_iter()
+            .filter(|e| matches!(e.event, PlaybackEvent::Transition { revision: 7, .. }))
+            .collect();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].generation, 10);
+    }
+    #[test]
+    #[ignore = "requires mpv; verifies seek/recovery while the previous tail is audible"]
+    fn mpv_tail_seek_and_crash_keep_the_audible_track() {
+        let a = AudioFile::wav(6, 1000);
+        let b = AudioFile::wav(10, -2000);
+        for crash in [false, true] {
+            let (mut engine, events) = local_engine();
+            engine.extra_args.push("--audio-buffer=3".into());
+            engine.handle(PlayerCommand::Play {
+                track: a.track(),
+                generation: 10,
+            });
+            engine.handle(PlayerCommand::SetPaused(true));
+            engine.handle(PlayerCommand::PrepareNext {
+                track: Some(b.track()),
+                generation: 10,
+                revision: 7,
+            });
+            drive(&mut engine, |e| {
+                e.next.as_ref().is_some_and(|n| n.entry.is_some())
+            });
+            engine.handle(PlayerCommand::SetPaused(false));
+            drive(&mut engine, |e| {
+                e.handoff
+                    .as_ref()
+                    .is_some_and(|h| h.audio_pts.is_some_and(|p| p < -1.))
+            });
+            engine.handle(PlayerCommand::SetPaused(true));
+            let position = if crash {
+                let position = engine.handoff.as_ref().unwrap().previous.position;
+                engine.process.as_mut().unwrap().kill().unwrap();
+                engine.process.as_mut().unwrap().wait().unwrap();
+                position
+            } else {
+                engine.handle(PlayerCommand::Seek(1.));
+                1.
+            };
+            drive(&mut engine, |e| {
+                e.generation() == 10
+                    && e.handoff.is_none()
+                    && e.current.as_ref().is_some_and(|c| c.ready && c.seekable)
+                    && e.next.as_ref().is_some_and(|n| n.entry.is_some())
+            });
+            assert_eq!(engine.current.as_ref().unwrap().binding.track, a.track());
+            assert!((engine.current.as_ref().unwrap().position - position).abs() < 0.2);
+            assert!(engine.paused);
+            assert!(events.try_iter().all(|e| !matches!(
+                e.event,
+                PlaybackEvent::Transition { .. } | PlaybackEvent::Error(_)
+            )));
+        }
+    }
+    #[test]
+    #[ignore = "requires mpv; verifies the final track's buffered tail is not cut off"]
+    fn mpv_final_track_ends_after_output_drains() {
+        let a = AudioFile::wav(6, 1000);
+        let (mut engine, events) = local_engine();
+        engine.extra_args.push("--audio-buffer=3".into());
+        engine.handle(PlayerCommand::Play {
+            track: a.track(),
+            generation: 10,
+        });
+        engine.handle(PlayerCommand::SetPaused(true));
+        drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ready));
+        events.try_iter().for_each(drop);
+        let started = Instant::now();
+        engine.handle(PlayerCommand::SetPaused(false));
+        drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ended));
+        assert!(
+            started.elapsed() >= Duration::from_millis(5700),
+            "early EOF at {:?}",
+            started.elapsed()
+        );
+        assert!(
+            events
+                .try_iter()
+                .any(|e| matches!(e.event, PlaybackEvent::Ended))
+        );
     }
     #[test]
     #[ignore = "requires mpv; verifies exact contiguous PCM output from the engine"]
@@ -1444,6 +1929,34 @@ mod integration_tests {
             events
                 .iter()
                 .any(|e| matches!(e.event, PlaybackEvent::Paused(true)))
+        );
+    }
+    #[test]
+    #[ignore = "requires mpv; verifies an unresponsive paused player is recovered"]
+    fn mpv_engine_recovers_hung_ipc_even_while_paused() {
+        let a = AudioFile::wav(8, 500);
+        let (mut engine, events) = local_engine();
+        engine.handle(PlayerCommand::Play {
+            track: a.track(),
+            generation: 8,
+        });
+        engine.handle(PlayerCommand::SetPaused(true));
+        drive(&mut engine, |e| e.current.as_ref().is_some_and(|c| c.ready));
+        let pid = engine.process.as_ref().unwrap().id();
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+        // Move the deadline forward rather than make the suite sleep 10 seconds.
+        engine.heartbeat_sent = Some(Instant::now() - Duration::from_secs(11));
+        drive(&mut engine, |e| {
+            e.current
+                .as_ref()
+                .is_some_and(|c| c.retries == 1 && c.ready)
+        });
+        assert_ne!(engine.process.as_ref().unwrap().id(), pid);
+        assert!(engine.paused);
+        assert!(
+            events
+                .try_iter()
+                .any(|e| e.generation == 8 && matches!(e.event, PlaybackEvent::Recovering))
         );
     }
     #[test]
