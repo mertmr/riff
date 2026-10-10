@@ -15,7 +15,10 @@ serde_json = "1"
 directories = "6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Pipes", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Pipes", "Win32_Foundation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 # Isolated fixtures and native screenshot capture for visual QA. Never enabled by default.

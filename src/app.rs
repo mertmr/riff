@@ -32,7 +32,7 @@ pub enum View {
     Playlists,
     Collection,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Playback {
     Empty,
     Loading,
@@ -270,6 +270,7 @@ pub struct MusicApp {
     recommendation_rx: Receiver<SearchResult>,
     worker_ctx: egui::Context,
     generation: u64,
+    scheduled_next: Option<(u64, u64, Track)>,
     player_tx: Sender<PlayerCommand>,
     player_rx: Receiver<PlayerEvent>,
     player_worker: Option<thread::JoinHandle<()>>,
@@ -436,6 +437,7 @@ impl MusicApp {
             recommendation_rx,
             worker_ctx: ctx.clone(),
             generation: 0,
+            scheduled_next: None,
             player_tx,
             player_rx,
             player_worker: Some(worker),
@@ -675,6 +677,22 @@ impl MusicApp {
         self.persist();
     }
     fn play(&mut self, track: Track, add_history: bool) {
+        self.begin_track(track.clone(), add_history);
+        if self
+            .player_tx
+            .send(PlayerCommand::Play {
+                track,
+                generation: self.generation,
+            })
+            .is_err()
+        {
+            self.playback = Playback::Error;
+            self.playback_error =
+                Some("The audio worker stopped. Restart Riff to reconnect.".into());
+        }
+    }
+    fn begin_track(&mut self, track: Track, add_history: bool) {
+        self.scheduled_next = None;
         if let Some(radio) = &mut self.radio {
             radio.waiting = false;
             radio.remember(&track.id);
@@ -690,25 +708,66 @@ impl MusicApp {
             }
         }
         self.generation = self.generation.wrapping_add(1);
-        self.current = Some(track.clone());
+        self.current = Some(track);
         self.playback = Playback::Loading;
         self.buffering = false;
         self.position = 0.;
         self.duration = None;
         self.seekable = false;
         self.playback_error = None;
-        if self
-            .player_tx
-            .send(PlayerCommand::Play {
-                track,
-                generation: self.generation,
-            })
-            .is_err()
+    }
+    fn sync_next(&mut self) {
+        let desired = if matches!(
+            self.playback,
+            Playback::Loading | Playback::Playing | Playback::Paused
+        ) {
+            self.queue_track(0)
+                .map(|track| (self.generation, self.queue_revision, track.clone()))
+        } else {
+            None
+        };
+        // Editing the tail doesn't change the next track or require another
+        // extractor process. Revision identifies the scheduled choice itself.
+        if desired
+            .as_ref()
+            .zip(self.scheduled_next.as_ref())
+            .is_some_and(|(new, old)| new.0 == old.0 && new.2 == old.2)
         {
-            self.playback = Playback::Error;
-            self.playback_error =
-                Some("The audio worker stopped. Restart Riff to reconnect.".into());
+            return;
         }
+        if desired == self.scheduled_next {
+            return;
+        }
+        self.scheduled_next = desired;
+        let _ = self.player_tx.send(PlayerCommand::PrepareNext {
+            track: self
+                .scheduled_next
+                .as_ref()
+                .map(|(_, _, track)| track.clone()),
+            generation: self.generation,
+            revision: self.queue_revision,
+        });
+    }
+    fn transition(&mut self, track: Track, revision: u64) {
+        if self.scheduled_next.as_ref() != Some(&(self.generation, revision, track.clone()))
+            || self.queue_track(0) != Some(&track)
+        {
+            // A queue edit crossed the native handoff. Replace stale audio with
+            // the current queue choice without consuming the removed occurrence.
+            self.next();
+            return;
+        }
+        if self.queue.pop_front().is_none()
+            && let Some(radio) = &mut self.radio
+        {
+            radio.upcoming.pop_front();
+            radio.continuation = track.clone();
+        }
+        self.queue_revision = self.queue_revision.wrapping_add(1);
+        self.begin_track(track, true);
+        self.queue_selected = None;
+        self.persist();
+        self.refill_radio();
     }
     fn next(&mut self) {
         self.queue_revision = self.queue_revision.wrapping_add(1);
@@ -917,8 +976,16 @@ impl MusicApp {
                 continue;
             }
             match message.event {
+                PlaybackEvent::Transition { track, revision } => self.transition(track, revision),
+                PlaybackEvent::Recovering => {
+                    self.playback = Playback::Loading;
+                    self.buffering = true;
+                    self.seekable = false;
+                    self.playback_error = None;
+                }
                 PlaybackEvent::Ready => {
                     self.playback = Playback::Playing;
+                    self.buffering = false;
                     if let Some(track) = &self.current {
                         self.recent.retain(|t| t.id != track.id);
                         self.recent.insert(0, track.clone());
@@ -965,6 +1032,7 @@ impl MusicApp {
         {
             self.notice = None;
         }
+        self.sync_next();
     }
     pub fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
         if matches!(
@@ -1439,6 +1507,7 @@ impl MusicApp {
             Action::DismissError => self.global_error = None,
             Action::DismissNotice => self.notice = None,
         }
+        self.sync_next();
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if self.playlist_editor.is_some() {
@@ -1780,6 +1849,9 @@ mod tests {
         app.dispatch(Action::Enqueue(b.clone(), false), &ctx);
         app.dispatch(Action::StartRadio(a.clone()), &ctx);
         commands.recv().unwrap();
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::PrepareNext { track: Some(track), .. } if track == b)
+        );
         let job = jobs.recv().unwrap();
         assert_eq!(job.query, a.id);
         results
@@ -1821,6 +1893,11 @@ mod tests {
                 commands.recv().unwrap(),
                 PlayerCommand::Play { .. }
             ));
+            assert!(
+                commands
+                    .try_iter()
+                    .all(|command| matches!(command, PlayerCommand::PrepareNext { .. }))
+            );
         }
         assert!(app.queue.is_empty());
         assert!(app.radio.is_some());
@@ -1959,7 +2036,11 @@ mod tests {
         assert!(app.can_queue_move(1, -1));
         app.dispatch(Action::StopRadio, &ctx);
         assert_eq!(app.queue, VecDeque::from([b]));
-        assert!(commands.try_recv().is_err());
+        assert!(
+            commands
+                .try_iter()
+                .all(|command| matches!(command, PlayerCommand::PrepareNext { .. }))
+        );
     }
     #[test]
     fn queue_edits_keep_the_current_track_and_navigation_keeps_playback() {
@@ -1993,6 +2074,9 @@ mod tests {
         app.dispatch(Action::Play(a), &ctx);
         commands.recv().unwrap();
         app.dispatch(Action::Enqueue(b.clone(), false), &ctx);
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::PrepareNext { track: Some(track), .. } if track == b)
+        );
         for event in [
             PlaybackEvent::Ready,
             PlaybackEvent::Position(179.),
@@ -2015,6 +2099,133 @@ mod tests {
             commands.recv().unwrap(),
             PlayerCommand::Play { .. }
         ));
+    }
+    #[test]
+    fn native_handoffs_consume_one_occurrence_and_preserve_history() {
+        let (mut app, commands, events, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        app.dispatch(
+            Action::PlayTracks(vec![a.clone(), b.clone(), b.clone()]),
+            &ctx,
+        );
+        assert!(matches!(
+            commands.recv().unwrap(),
+            PlayerCommand::Play { .. }
+        ));
+        let PlayerCommand::PrepareNext { revision, .. } = commands.recv().unwrap() else {
+            panic!("next track wasn't prepared")
+        };
+        let parent = app.generation;
+        // Tail edits preserve the preloaded stream and its scheduling ticket.
+        app.dispatch(Action::Enqueue(a.clone(), false), &ctx);
+        assert!(commands.try_recv().is_err());
+        events
+            .send(PlayerEvent {
+                generation: parent,
+                event: PlaybackEvent::Transition {
+                    track: b.clone(),
+                    revision,
+                },
+            })
+            .unwrap();
+        events
+            .send(PlayerEvent {
+                generation: parent.wrapping_add(1),
+                event: PlaybackEvent::Ready,
+            })
+            .unwrap();
+        // A duplicate delivery must not consume the second occurrence.
+        events
+            .send(PlayerEvent {
+                generation: parent,
+                event: PlaybackEvent::Transition {
+                    track: b.clone(),
+                    revision,
+                },
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(app.current, Some(b.clone()));
+        assert_eq!(app.queue, VecDeque::from([b.clone(), a.clone()]));
+        assert_eq!(app.history, vec![a]);
+        assert_eq!(app.recent.first(), Some(&b));
+        assert_eq!(app.playback, Playback::Playing);
+        assert!(
+            commands
+                .try_iter()
+                .all(|command| matches!(command, PlayerCommand::PrepareNext { .. }))
+        );
+    }
+    #[test]
+    fn queue_edit_crossing_handoff_plays_the_current_choice() {
+        let (mut app, commands, events, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        let c = track("JGwWNGJdvx8");
+        app.dispatch(Action::PlayTracks(vec![a, b.clone(), c.clone()]), &ctx);
+        commands.recv().unwrap();
+        let PlayerCommand::PrepareNext {
+            revision,
+            generation,
+            ..
+        } = commands.recv().unwrap()
+        else {
+            panic!()
+        };
+        app.dispatch(Action::QueueRemove(0), &ctx);
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::PrepareNext { track: Some(track), .. } if track == c)
+        );
+        events
+            .send(PlayerEvent {
+                generation,
+                event: PlaybackEvent::Transition { track: b, revision },
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(app.current, Some(c.clone()));
+        assert!(app.queue.is_empty());
+        assert!(
+            matches!(commands.recv().unwrap(), PlayerCommand::Play { track, .. } if track == c)
+        );
+        app.dispatch(Action::Stop, &ctx);
+        events
+            .send(PlayerEvent {
+                generation,
+                event: PlaybackEvent::Transition { track: c, revision },
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(app.playback, Playback::Stopped);
+    }
+    #[test]
+    fn recovery_preserves_queue_and_position_then_restores_pause() {
+        let (mut app, commands, events, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        app.dispatch(Action::PlayTracks(vec![a.clone(), b.clone()]), &ctx);
+        commands.try_iter().for_each(drop);
+        app.position = 32.;
+        for event in [
+            PlaybackEvent::Recovering,
+            PlaybackEvent::Ready,
+            PlaybackEvent::Paused(true),
+        ] {
+            events
+                .send(PlayerEvent {
+                    generation: app.generation,
+                    event,
+                })
+                .unwrap();
+        }
+        app.receive();
+        assert_eq!(app.current, Some(a));
+        assert_eq!(app.queue, VecDeque::from([b]));
+        assert_eq!(app.position, 32.);
+        assert_eq!(app.playback, Playback::Paused);
+        assert!(!app.buffering);
+        assert!(commands.try_recv().is_err());
     }
     #[test]
     fn stale_events_cannot_replace_playback_and_recent_requires_ready() {

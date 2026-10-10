@@ -53,7 +53,9 @@ fn now_playing(app: &mut MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Actio
             12.,
             MUTED,
         );
-        let status = if app.buffering {
+        let status = if app.buffering && app.playback == Playback::Loading {
+            "Reconnecting audio…"
+        } else if app.buffering {
             "Buffering…"
         } else {
             match app.playback {
@@ -333,7 +335,7 @@ fn extras(app: &MusicApp, ui: &mut Ui, r: Rect, actions: &mut Vec<Action>) {
         10.,
         DIM,
     );
-    if app.buffering {
+    if app.buffering && app.playback != Playback::Loading {
         widgets::text(
             ui,
             Rect::from_min_size(pos2(r.left(), r.top() + 10.), vec2(r.width(), 16.)),
