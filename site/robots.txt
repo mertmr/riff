@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://mertmr.github.io/riff/sitemap.xml
