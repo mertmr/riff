@@ -5,7 +5,7 @@ use super::{
     widgets::{self, Row},
 };
 use crate::app::{Action, LibraryTab, MusicApp, Playback, View};
-use eframe::egui::{self, Align2, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{self, Align2, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 pub fn sidebar(app: &mut MusicApp, ui: &mut Ui, compact: bool, actions: &mut Vec<Action>) {
     ui.add_space(if cfg!(target_os = "macos") { 32. } else { 12. });

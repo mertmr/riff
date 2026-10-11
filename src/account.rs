@@ -65,7 +65,7 @@ pub struct State {
     pub worker: Worker,
 }
 impl State {
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: egui::Context) -> Self {
         Self {
             library: None,
             loading: false,
@@ -202,7 +202,7 @@ impl Worker {
             results,
         )
     }
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: egui::Context) -> Self {
         let (tx, jobs) = mpsc::channel::<Job>();
         let (results, rx) = mpsc::channel();
         let epoch = Arc::new(AtomicU64::new(0));

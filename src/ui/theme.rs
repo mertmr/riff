@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, FontData, FontFamily, FontId, Stroke, TextStyle};
+use egui::{self, Color32, FontData, FontFamily, FontId, Stroke, TextStyle};
 
 pub const BG: Color32 = Color32::from_rgb(8, 11, 18);
 pub const SIDEBAR: Color32 = Color32::from_rgb(12, 15, 23);

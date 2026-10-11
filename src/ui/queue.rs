@@ -4,7 +4,7 @@ use super::{
     widgets::{self, Row},
 };
 use crate::app::{Action, MusicApp, Playback};
-use eframe::egui::{self, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{self, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     egui::Panel::right("queue_drawer")

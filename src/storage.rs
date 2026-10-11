@@ -19,6 +19,8 @@ pub struct Session {
     pub recent: Vec<Track>,
     pub queue: Vec<Track>,
     pub volume: u8,
+    #[serde(default = "default_cache_audio")]
+    pub cache_audio: bool,
     pub current: Option<Track>,
     pub position: f64,
     pub saved_tracks: Arc<Vec<Track>>,
@@ -26,12 +28,16 @@ pub struct Session {
     pub artists: Arc<Vec<Collection>>,
     pub playlists: Arc<Vec<Playlist>>,
 }
+fn default_cache_audio() -> bool {
+    true
+}
 impl Default for Session {
     fn default() -> Self {
         Self {
             recent: Vec::new(),
             queue: Vec::new(),
             volume: 70,
+            cache_audio: true,
             current: None,
             position: 0.,
             saved_tracks: Default::default(),
@@ -121,14 +127,14 @@ pub struct LibraryWriter {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl LibraryWriter {
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: egui::Context) -> Self {
         Self::with_save(ctx, |snapshot| {
             save("favorites.json", &snapshot.favorites)
                 .and_then(|()| save("session.json", &snapshot.session))
         })
     }
     fn with_save(
-        ctx: eframe::egui::Context,
+        ctx: egui::Context,
         mut write: impl FnMut(Snapshot) -> Result<(), String> + Send + 'static,
     ) -> Self {
         // One latest snapshot and one notification, even when disk writes are
@@ -204,7 +210,7 @@ mod tests {
         let (written, writes) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
         let mut first = true;
-        let writer = LibraryWriter::with_save(eframe::egui::Context::default(), move |snapshot| {
+        let writer = LibraryWriter::with_save(egui::Context::default(), move |snapshot| {
             written.send(snapshot.session.volume).unwrap();
             if first {
                 first = false;

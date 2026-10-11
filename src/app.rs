@@ -9,7 +9,6 @@ use crate::{
     storage::{self, LibraryWriter, Session},
     ui,
 };
-use eframe::egui;
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
@@ -87,6 +86,7 @@ pub enum Action {
     Volume(u8),
     Mute,
     Seek(f64),
+    SetCacheAudio(bool),
     PlayFavorites,
     RefreshLibrary,
     LibraryTab(LibraryTab),
@@ -264,6 +264,7 @@ pub struct MusicApp {
     pub seekable: bool,
     pub volume: u8,
     unmuted_volume: u8,
+    pub cache_audio: bool,
     pub playback_error: Option<String>,
     pub global_error: Option<String>,
     pub notice: Option<Notice>,
@@ -294,10 +295,11 @@ pub struct MusicApp {
     pub qa: Option<crate::qa::Capture>,
 }
 impl MusicApp {
+    #[cfg(not(target_os = "macos"))]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::from_context(&cc.egui_ctx)
     }
-    fn from_context(ctx: &egui::Context) -> Self {
+    pub(crate) fn from_context(ctx: &egui::Context) -> Self {
         let (favorites, session, global_error) = storage::load_library();
         let mut app = Self::from_library(ctx, favorites, session, global_error);
         #[cfg(feature = "ui-qa")]
@@ -473,6 +475,7 @@ impl MusicApp {
             seekable: false,
             volume: session.volume,
             unmuted_volume: session.volume.max(1),
+            cache_audio: session.cache_audio,
             playback_error: None,
             global_error,
             notice: None,
@@ -504,6 +507,9 @@ impl MusicApp {
         };
         app.rebuild_library();
         let _ = app.player_tx.send(PlayerCommand::SetVolume(app.volume));
+        let _ = app
+            .player_tx
+            .send(PlayerCommand::SetCacheEnabled(app.cache_audio));
         #[cfg(feature = "ui-qa")]
         crate::qa::configure(&mut app);
         app
@@ -559,6 +565,7 @@ impl MusicApp {
                 recent: self.recent.clone(),
                 queue: self.queue.iter().cloned().collect(),
                 volume: self.volume,
+                cache_audio: self.cache_audio,
                 current: self.current.clone(),
                 position: self.position,
                 saved_tracks: snapshot.tracks.clone(),
@@ -1032,7 +1039,7 @@ impl MusicApp {
         };
         index < self.queue_len() && target < self.queue_len()
     }
-    fn receive(&mut self) {
+    pub(crate) fn receive(&mut self) {
         while let Ok(message) = self.account.worker.rx.try_recv() {
             if message.token != self.account.worker.token {
                 continue;
@@ -1545,6 +1552,15 @@ impl MusicApp {
                 }),
                 ctx,
             ),
+            Action::SetCacheAudio(enabled) => {
+                if self.cache_audio == enabled {
+                    return;
+                }
+                self.cache_audio = enabled;
+                let _ = self.player_tx.send(PlayerCommand::SetCacheEnabled(enabled));
+                ctx.request_repaint();
+                self.persist();
+            }
             Action::Seek(p) => {
                 if self.current.is_some() && p.is_finite() {
                     let max = self.effective_duration().unwrap_or(f64::MAX);
@@ -1927,15 +1943,8 @@ impl MusicApp {
                 ))
     }
 }
-impl eframe::App for MusicApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // eframe also calls logic for covered/minimized windows. Drain events
-        // and advance the queue there, without rendering or retaining a backlog.
-        self.receive();
-        #[cfg(feature = "ui-qa")]
-        crate::qa::report_startup(_frame);
-    }
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl MusicApp {
+    pub(crate) fn draw_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         // Start only when Home is shown; opt-in captures keep their deterministic fixtures.
         #[cfg(feature = "ui-qa")]
@@ -1964,6 +1973,19 @@ impl eframe::App for MusicApp {
         crate::qa::capture(self, &ctx);
         #[cfg(feature = "ui-qa")]
         crate::qa::finish_first_ui(&ctx);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+impl eframe::App for MusicApp {
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe also calls logic for covered/minimized windows. Drain events
+        // and advance the queue there, without rendering or retaining a backlog.
+        self.receive();
+        #[cfg(feature = "ui-qa")]
+        crate::qa::report_startup(_frame.info().cpu_usage.is_some());
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw_ui(ui);
     }
 }
 impl Drop for MusicApp {
@@ -2625,8 +2647,7 @@ mod tests {
                     event: PlaybackEvent::Ended,
                 })
                 .unwrap();
-            let mut frame = eframe::Frame::_new_kittest();
-            eframe::App::logic(&mut app, &ctx, &mut frame);
+            app.receive();
             assert_eq!(app.current, Some(expected));
             assert!(matches!(
                 commands.recv().unwrap(),
@@ -2828,9 +2849,8 @@ mod tests {
                 })
                 .unwrap();
         }
-        let mut frame = eframe::Frame::_new_kittest();
-        // Match eframe's hidden-window path: logic runs, no UI is constructed.
-        eframe::App::logic(&mut app, &ctx, &mut frame);
+        // The hidden-window path drains events without constructing the UI.
+        app.receive();
         assert_eq!(app.current, Some(b));
         assert!(app.queue.is_empty());
         assert!(app.player_rx.try_recv().is_err());

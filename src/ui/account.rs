@@ -7,7 +7,7 @@ use crate::{
     app::{Action, MusicApp, Playback},
     model::Track,
 };
-use eframe::egui::{self, RichText, Ui};
+use egui::{self, RichText, Ui};
 
 pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     widgets::heading(
@@ -49,6 +49,8 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.add_space(8.);
         ui.label(RichText::new(error).color(ERROR));
     }
+    ui.add_space(12.);
+    playback_settings(app, ui, actions);
     ui.add_space(12.);
     if app.account.library.is_none() {
         ui.label("Sign in with Google to fetch your YouTube likes, subscriptions, and private playlists.");
@@ -209,6 +211,30 @@ pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
                 });
         }
     }
+    ui.add_space(12.);
+    playback_settings(app, ui, actions);
+}
+
+fn playback_settings(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
+    ui.label(RichText::new("Playback").font(bold(15.)));
+    let mut cache = app.cache_audio;
+    if ui
+        .checkbox(&mut cache, "Cache audio on disk")
+        .on_hover_text(
+            "When off, audio is streamed only and never saved to disk. Uses more data on replays.",
+        )
+        .changed()
+    {
+        actions.push(Action::SetCacheAudio(cache));
+    }
+    ui.label(
+        RichText::new(if app.cache_audio {
+            "Fully played songs are cached for up to 512 MB to replay offline."
+        } else {
+            "Stream-only mode: nothing is saved, every replay re-downloads."
+        })
+        .color(MUTED),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

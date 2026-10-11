@@ -9,7 +9,7 @@ mod screens;
 pub mod theme;
 pub mod widgets;
 use crate::app::{Action, MusicApp};
-use eframe::egui::{self, RichText, Stroke};
+use egui::{self, RichText, Stroke};
 use theme::*;
 
 pub fn show(app: &mut MusicApp, ui: &mut egui::Ui) {

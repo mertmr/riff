@@ -1,5 +1,5 @@
 use super::{icons::Icon, widgets};
-use eframe::egui::{self, Id, Sense, Ui, vec2};
+use egui::{self, Id, Sense, Ui, vec2};
 
 const GAP: f32 = 12.;
 

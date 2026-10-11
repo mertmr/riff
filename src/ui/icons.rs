@@ -1,5 +1,5 @@
 //! Resolution-independent icons with consistent strokes and optical sizes.
-use eframe::egui::{self, Color32, Painter, Rect, Shape, Stroke, pos2};
+use egui::{self, Color32, Painter, Rect, Shape, Stroke, pos2};
 
 #[derive(Clone, Copy)]
 pub enum Icon {

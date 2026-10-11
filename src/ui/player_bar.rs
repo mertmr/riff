@@ -1,6 +1,6 @@
 use super::{icons::Icon, theme::*, widgets};
 use crate::app::{Action, MusicApp, Playback};
-use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{self, Align2, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 pub fn show(app: &mut MusicApp, ui: &mut Ui, actions: &mut Vec<Action>) {
     egui::Panel::bottom("playback_bar")

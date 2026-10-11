@@ -3,6 +3,8 @@ mod app;
 mod audio_cache;
 mod catalog;
 mod model;
+#[cfg(target_os = "macos")]
+mod native;
 mod player;
 #[cfg(feature = "ui-qa")]
 mod qa;
@@ -11,9 +13,18 @@ mod search;
 mod storage;
 mod ui;
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "ui-qa")]
     qa::start_timer();
+    #[cfg(target_os = "macos")]
+    native::run()?;
+    #[cfg(not(target_os = "macos"))]
+    run_eframe()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_eframe() -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/riff-256.png"))
         .expect("bundled Riff icon must be a valid PNG");
     let wgpu_options = {
@@ -31,16 +42,11 @@ fn main() -> eframe::Result {
             ..Default::default()
         }
     };
-    let viewport = eframe::egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
         .with_title("Riff")
         .with_icon(icon)
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([960.0, 600.0]);
-    #[cfg(target_os = "macos")]
-    let viewport = viewport
-        .with_fullsize_content_view(true)
-        .with_title_shown(false)
-        .with_titlebar_shown(false);
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Wgpu,
@@ -58,7 +64,7 @@ fn main() -> eframe::Result {
                 .with_inner_size(qa::window_size())
                 .with_min_inner_size(qa::window_size())
                 .with_max_inner_size(qa::window_size())
-                .with_window_level(eframe::egui::WindowLevel::AlwaysOnTop)
+                .with_window_level(egui::WindowLevel::AlwaysOnTop)
                 .with_clamp_size_to_monitor_size(false),
             ..options
         }

@@ -2,7 +2,7 @@
 //! compressed bytes and decoded pixels are released as soon as they're uploaded.
 use super::{icons::Icon, widgets};
 use crate::model::{Track, is_valid_video_id};
-use eframe::egui::{self, ColorImage, Rect, TextureHandle, TextureOptions, Ui, pos2};
+use egui::{self, ColorImage, Rect, TextureHandle, TextureOptions, Ui, pos2};
 use std::{
     collections::HashMap,
     fs,
@@ -304,7 +304,17 @@ fn valid_artwork_url(url: &str) -> bool {
 
 fn artwork_size(points: f32, pixels_per_point: f32) -> u32 {
     let pixels = points * pixels_per_point;
-    if pixels <= 320. { 320 } else { 640 }
+    // Small list/player covers don't need the same allocation as album cards.
+    // Leave room for cropping a 16:9 video thumbnail into a square cover.
+    if pixels <= 72. {
+        128
+    } else if pixels <= 144. {
+        256
+    } else if pixels <= 320. {
+        320
+    } else {
+        640
+    }
 }
 
 fn sized_artwork_url(url: &str, size: u32) -> String {
@@ -460,7 +470,8 @@ mod tests {
 
     #[test]
     fn album_artwork_requests_account_for_display_scale_and_preserve_url_options() {
-        assert_eq!(artwork_size(64., 2.), 320);
+        assert_eq!(artwork_size(64., 1.), 128);
+        assert_eq!(artwork_size(64., 2.), 256);
         assert_eq!(artwork_size(220., 1.), 320);
         assert_eq!(artwork_size(220., 2.), 640);
         assert_eq!(artwork_size(1000., 2.), 640);
@@ -529,11 +540,11 @@ mod tests {
         };
         assert!(!render(&mut cache, 64.));
         let small = requests.try_recv().unwrap();
-        assert_eq!(small.size, 320);
+        assert_eq!(small.size, 128);
         done.send(Loaded {
             id: small.id.clone(),
             ticket: small.ticket,
-            image: Some(ColorImage::filled([320, 320], egui::Color32::BLACK)),
+            image: Some(ColorImage::filled([128, 128], egui::Color32::BLACK)),
         })
         .unwrap();
         assert!(render(&mut cache, 64.));
@@ -552,7 +563,7 @@ mod tests {
         assert!(render(&mut cache, 440.));
         assert!(render(&mut cache, 64.));
         assert!(requests.try_recv().is_err());
-        assert_eq!(cache.retained, (320 * 320 + 640 * 640) * 4);
+        assert_eq!(cache.retained, (128 * 128 + 640 * 640) * 4);
     }
 
     #[test]

@@ -4,9 +4,7 @@ use super::{
     theme::*,
 };
 use crate::{app::Action, model::Track};
-use eframe::egui::{
-    self, Color32, FontId, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2,
-};
+use egui::{self, Color32, FontId, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 pub fn gradient(p: &egui::Painter, rect: Rect, radius: f32, left: Color32, right: Color32) {
     let radius = radius.min(rect.width() / 2.).min(rect.height() / 2.);

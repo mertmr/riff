@@ -32,6 +32,7 @@ pub enum PlayerCommand {
     },
     SetPaused(bool),
     SetVolume(u8),
+    SetCacheEnabled(bool),
     Seek(f64),
     Stop,
     Shutdown,
@@ -217,6 +218,10 @@ impl Connection {
 // Audio has no need for mpv's video-sized, effectively whole-file cache.
 const AUDIO_OPTIONS: &[&str] = &[
     "--no-config",
+    // Riff supplies the controls; mpv's Lua UI and profile scripts are unused.
+    "--load-scripts=no",
+    "--osc=no",
+    "--load-auto-profiles=no",
     "--no-video",
     "--force-window=no",
     "--no-terminal",
@@ -306,6 +311,7 @@ struct Engine<W: Fn()> {
     load_pending: bool,
     trace: Option<latency::Trace>,
     cache: AudioCache,
+    cache_enabled: bool,
     bindings: HashMap<i64, Binding>,
     requests: HashMap<u64, Binding>,
     messages: VecDeque<Value>,
@@ -340,6 +346,7 @@ impl<W: Fn()> Engine<W> {
             load_pending: false,
             trace: latency::Trace::enabled(),
             cache: AudioCache::new(),
+            cache_enabled: true,
             bindings: HashMap::new(),
             requests: HashMap::new(),
             messages: VecDeque::new(),
@@ -390,6 +397,18 @@ impl<W: Fn()> Engine<W> {
     }
     fn generation(&self) -> u64 {
         self.current.as_ref().map_or(0, |c| c.binding.generation)
+    }
+    fn cached_lookup(cache: &AudioCache, enabled: bool, id: &str) -> Option<std::path::PathBuf> {
+        if !enabled {
+            return None;
+        }
+        cache.lookup(id)
+    }
+    fn service_directory(cache: &AudioCache, enabled: bool) -> Option<std::path::PathBuf> {
+        if !enabled {
+            return None;
+        }
+        cache.directory()
     }
     fn publish_handoff(&mut self) {
         let Some(handoff) = self.handoff.take() else {
@@ -593,7 +612,8 @@ impl<W: Fn()> Engine<W> {
                         .chain(self.following.iter())
                         .filter(|t| {
                             crate::model::is_valid_video_id(&t.id)
-                                && self.cache.lookup(&t.id).is_none()
+                                && Self::cached_lookup(&self.cache, self.cache_enabled, &t.id)
+                                    .is_none()
                         })
                         .map(|t| t.id.clone())
                         .collect();
@@ -634,6 +654,15 @@ impl<W: Fn()> Engine<W> {
                 // newer drag positions before the next command reaches mpv.
                 self.volume = value.min(100);
                 self.control(json!(["set_property", "volume", mpv_volume(self.volume)]));
+            }
+            PlayerCommand::SetCacheEnabled(enabled) => {
+                if self.cache_enabled != enabled {
+                    self.cache_enabled = enabled;
+                    // The streaming server captures its cache directory at
+                    // construction, so drop it and lazily recreate with the
+                    // correct directory (or no directory) on next load.
+                    self.service = None;
+                }
             }
             PlayerCommand::Seek(position) if position.is_finite() => {
                 if self.restore_audible_track(Some(position)) {
@@ -732,7 +761,7 @@ impl<W: Fn()> Engine<W> {
             return;
         };
         let binding = current.binding.clone();
-        let cached = self.cache.lookup(&binding.track.id);
+        let cached = Self::cached_lookup(&self.cache, self.cache_enabled, &binding.track.id);
         current.cached = cached.is_some();
         let source = (self.source)(&binding.track);
         let mut media = if let Some(path) = cached {
@@ -742,7 +771,7 @@ impl<W: Fn()> Engine<W> {
             Media::plain(path.to_string_lossy().into_owned())
         } else if source.starts_with("https://www.youtube.com/watch?") {
             if self.service.is_none() {
-                match Service::new(self.cache.directory()) {
+                match Service::new(Self::service_directory(&self.cache, self.cache_enabled)) {
                     Ok(service) => self.service = Some(service),
                     Err(error) => {
                         self.fail(error);
@@ -761,7 +790,8 @@ impl<W: Fn()> Engine<W> {
                             .chain(self.following.iter())
                             .filter(|t| {
                                 crate::model::is_valid_video_id(&t.id)
-                                    && self.cache.lookup(&t.id).is_none()
+                                    && Self::cached_lookup(&self.cache, self.cache_enabled, &t.id)
+                                        .is_none()
                             })
                             .map(|t| t.id.clone())
                             .collect(),
@@ -795,7 +825,8 @@ impl<W: Fn()> Engine<W> {
                         .chain(self.following.iter())
                         .filter(|t| {
                             crate::model::is_valid_video_id(&t.id)
-                                && self.cache.lookup(&t.id).is_none()
+                                && Self::cached_lookup(&self.cache, self.cache_enabled, &t.id)
+                                    .is_none()
                         })
                         .map(|t| t.id.clone())
                         .collect(),
@@ -840,10 +871,12 @@ impl<W: Fn()> Engine<W> {
         if self.service.is_none()
             && self.next.as_ref().is_some_and(|n| {
                 (self.source)(&n.binding.track).starts_with("https://www.youtube.com/watch?")
-                    && self.cache.lookup(&n.binding.track.id).is_none()
+                    && Self::cached_lookup(&self.cache, self.cache_enabled, &n.binding.track.id)
+                        .is_none()
             })
         {
-            self.service = Service::new(self.cache.directory()).ok();
+            self.service =
+                Service::new(Self::service_directory(&self.cache, self.cache_enabled)).ok();
             if let Some(service) = &self.service {
                 if let Some(current) = &self.current {
                     service.playing(&current.binding.track.id);
@@ -855,7 +888,8 @@ impl<W: Fn()> Engine<W> {
                         .chain(self.following.iter())
                         .filter(|t| {
                             crate::model::is_valid_video_id(&t.id)
-                                && self.cache.lookup(&t.id).is_none()
+                                && Self::cached_lookup(&self.cache, self.cache_enabled, &t.id)
+                                    .is_none()
                         })
                         .map(|t| t.id.clone())
                         .collect(),
@@ -867,7 +901,9 @@ impl<W: Fn()> Engine<W> {
             next.attempted = true;
             next.cached = false;
             let url = (self.source)(&next.binding.track);
-            if let Some(path) = self.cache.lookup(&next.binding.track.id) {
+            if let Some(path) =
+                Self::cached_lookup(&self.cache, self.cache_enabled, &next.binding.track.id)
+            {
                 let mut media = Media::plain(path.to_string_lossy().into_owned());
                 media.options["ytdl"] = json!("no");
                 next.media = Some(media);
@@ -1464,6 +1500,20 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+    #[test]
+    fn disabling_audio_cache_stops_lookups_and_disk_writes() {
+        let (tx, _rx) = mpsc::channel();
+        let mut engine: Engine<fn()> = Engine::new(tx, || {});
+        assert!(engine.cache_enabled);
+        assert!(Engine::<fn()>::cached_lookup(&engine.cache, true, "dQw4w9WgXcQ").is_none());
+        assert!(Engine::<fn()>::service_directory(&engine.cache, true).is_some());
+        engine.handle(PlayerCommand::SetCacheEnabled(false));
+        assert!(!engine.cache_enabled);
+        assert!(Engine::<fn()>::cached_lookup(&engine.cache, false, "dQw4w9WgXcQ").is_none());
+        assert!(Engine::<fn()>::service_directory(&engine.cache, false).is_none());
+        engine.handle(PlayerCommand::SetCacheEnabled(true));
+        assert!(engine.cache_enabled);
     }
     #[test]
     fn playback_truth_comes_from_ipc() {

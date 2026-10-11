@@ -4,7 +4,6 @@ use crate::{
     model::{Collection, CollectionKind, Playlist, SavedAlbum, Track},
     radio::Radio,
 };
-use eframe::egui;
 use std::{
     path::PathBuf,
     sync::{
@@ -27,15 +26,15 @@ pub fn finish_first_ui(ctx: &egui::Context) {
         && let Some(start) = START.get()
     {
         let _ = FIRST_UI_MS.set(start.elapsed().as_secs_f64() * 1000.0);
-        // The following logic call occurs after eframe has painted, presented,
+        // The following logic call occurs after the renderer has painted, presented,
         // and shown the first native frame. No screenshot readback is needed.
         ctx.request_repaint();
     }
 }
 
-pub fn report_startup(frame: &eframe::Frame) {
+pub fn report_startup(painted: bool) {
     if std::env::var_os("RIFF_QA_STARTUP").is_some()
-        && frame.info().cpu_usage.is_some()
+        && painted
         && let Some(first_ui_ms) = FIRST_UI_MS.get()
         && !REPORTED.swap(true, Ordering::Relaxed)
         && let Some(start) = START.get()
