@@ -12,7 +12,58 @@ use std::{
 };
 
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+const IOS_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+const WEB_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const MAX_ENTRIES: usize = 32;
+
+struct PlayerClient {
+    name: &'static str,
+    version: &'static str,
+    header_name: &'static str,
+    header_version: &'static str,
+    user_agent: &'static str,
+}
+// Ordered by preference. VISIONOS currently returns direct audio URLs most
+// reliably; IOS and WEB are fallbacks when one client is blocked or returns
+// no playable audio format.
+const CLIENTS: [PlayerClient; 3] = [
+    PlayerClient {
+        name: "VISIONOS",
+        version: "0.1",
+        header_name: "101",
+        header_version: "0.1",
+        user_agent: USER_AGENT,
+    },
+    PlayerClient {
+        name: "IOS",
+        version: "20.03.02",
+        header_name: "5",
+        header_version: "20.03.02",
+        user_agent: IOS_USER_AGENT,
+    },
+    PlayerClient {
+        name: "WEB",
+        version: "2.20250222.10.01",
+        header_name: "1",
+        header_version: "2.20250222.10.01",
+        user_agent: WEB_USER_AGENT,
+    },
+];
+
+fn client_context(client: &PlayerClient, visitor: &str) -> Value {
+    match client.name {
+        "IOS" => json!({"clientName": client.name, "clientVersion": client.version,
+            "visitorData": visitor, "userAgent": client.user_agent,
+            "hl": "en", "gl": "US", "osName": "iPhone",
+            "osVersion": "17.5.1.14F90", "deviceMake": "Apple", "deviceModel": "iPhone16,2"}),
+        "WEB" => json!({"clientName": client.name, "clientVersion": client.version,
+            "visitorData": visitor, "userAgent": client.user_agent, "hl": "en", "gl": "US"}),
+        _ => json!({"clientName": client.name, "clientVersion": client.version,
+            "visitorData": visitor, "userAgent": client.user_agent,
+            "hl": "en", "gl": "US", "osName": "visionOS", "osVersion": "1.3.21O771",
+            "deviceMake": "Apple", "deviceModel": "RealityDevice14,1"}),
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Media {
@@ -320,49 +371,89 @@ fn resolve(
     if slot.cancelled.load(Ordering::Relaxed) {
         return Err("Superseded selection".into());
     }
-    let payload = json!({"context":{"client":{"clientName":"VISIONOS","clientVersion":"0.1","visitorData":visitor,"userAgent":USER_AGENT,"hl":"en","gl":"US","osName":"visionOS","osVersion":"1.3.21O771","deviceMake":"Apple","deviceModel":"RealityDevice14,1"}},"videoId":slot.id,"contentCheckOk":true,"racyCheckOk":true,"playbackContext":{"contentPlaybackContext":{"html5Preference":"HTML5_PREF_WANTS"}}});
-    let mut response = agent
-        .post("https://www.youtube.com/youtubei/v1/player")
-        .header("Content-Type", "application/json")
-        .header("Origin", "https://www.youtube.com")
-        .header("User-Agent", USER_AGENT)
-        .header("X-Youtube-Client-Name", "101")
-        .header("X-Youtube-Client-Version", "0.1")
-        .header("X-Goog-Visitor-Id", &visitor)
-        .config()
-        .http_status_as_error(false)
-        .build()
-        .send(payload.to_string())
-        .map_err(|e| format!("Couldn't resolve audio: {e}"))?;
-    let status = response.status().as_u16();
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(1024 * 1024)
-        .read_to_vec()
-        .map_err(|e| e.to_string())?;
-    if slot.cancelled.load(Ordering::Relaxed) {
-        return Err("Superseded selection".into());
-    }
-    let data: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid player response")?;
-    if status != 200 {
-        if matches!(status, 400 | 403) {
-            let mut cached = session.lock().unwrap();
-            if cached.as_ref() == Some(&visitor) {
-                *cached = None;
+    let mut last_error = String::from("YouTube rejected playback");
+    for client in &CLIENTS {
+        if slot.cancelled.load(Ordering::Relaxed) {
+            return Err("Superseded selection".into());
+        }
+        let payload = json!({"context": {"client": client_context(client, &visitor)},
+            "videoId": slot.id, "contentCheckOk": true, "racyCheckOk": true,
+            "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}}});
+        let response = agent
+            .post("https://www.youtube.com/youtubei/v1/player")
+            .header("Content-Type", "application/json")
+            .header("Origin", "https://www.youtube.com")
+            .header("User-Agent", client.user_agent)
+            .header("X-Youtube-Client-Name", client.header_name)
+            .header("X-Youtube-Client-Version", client.header_version)
+            .header("X-Goog-Visitor-Id", &visitor)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send(payload.to_string());
+        let mut response = match response {
+            Ok(response) => response,
+            Err(e) => {
+                last_error = format!("Couldn't resolve audio: {e}");
+                continue;
+            }
+        };
+        let status = response.status().as_u16();
+        let bytes = match response
+            .body_mut()
+            .with_config()
+            .limit(1024 * 1024)
+            .read_to_vec()
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+        if slot.cancelled.load(Ordering::Relaxed) {
+            return Err("Superseded selection".into());
+        }
+        let data: Value = match serde_json::from_slice(&bytes) {
+            Ok(data) => data,
+            Err(_) => {
+                last_error = "Invalid player response".into();
+                continue;
+            }
+        };
+        if status != 200 {
+            if matches!(status, 400 | 403) {
+                let mut cached = session.lock().unwrap();
+                if cached.as_ref() == Some(&visitor) {
+                    *cached = None;
+                }
+            }
+            last_error = format!(
+                "YouTube player HTTP {status}: {}",
+                data["error"]["message"]
+                    .as_str()
+                    .unwrap_or("request rejected")
+            );
+            continue;
+        }
+        match parse_stream(&data, &slot.id, slot.cancelled.clone(), client.user_agent) {
+            Ok(stream) => {
+                // Reject URLs that only serve an opening preview before handing them to mpv.
+                match stream.fetch(agent, stream.length - 1, stream.length - 1) {
+                    Ok(_) => return Ok(stream),
+                    Err(e) => {
+                        last_error = e;
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = e;
+                continue;
             }
         }
-        return Err(format!(
-            "YouTube player HTTP {status}: {}",
-            data["error"]["message"]
-                .as_str()
-                .unwrap_or("request rejected")
-        ));
     }
-    let stream = parse_stream(&data, &slot.id, slot.cancelled.clone())?;
-    // Reject URLs that only serve an opening preview before handing them to mpv.
-    stream.fetch(agent, stream.length - 1, stream.length - 1)?;
-    Ok(stream)
+    Err(last_error)
 }
 fn visitor_data(page: &str) -> Option<String> {
     let (_, tail) = page.split_once("\"VISITOR_DATA\":")?;
@@ -372,7 +463,12 @@ fn visitor_data(page: &str) -> Option<String> {
         .ok()
         .filter(|v| !v.is_empty() && v.len() <= 1024)
 }
-fn parse_stream(data: &Value, id: &str, cancelled: Arc<AtomicBool>) -> Result<Stream, String> {
+fn parse_stream(
+    data: &Value,
+    id: &str,
+    cancelled: Arc<AtomicBool>,
+    user_agent: &str,
+) -> Result<Stream, String> {
     if data["playabilityStatus"]["status"] != "OK" {
         return Err(data["playabilityStatus"]["reason"]
             .as_str()
@@ -420,7 +516,7 @@ fn parse_stream(data: &Value, id: &str, cancelled: Arc<AtomicBool>) -> Result<St
     Ok(Stream::new(
         id.into(),
         url.into(),
-        USER_AGENT.into(),
+        user_agent.into(),
         format["contentLength"].as_str().unwrap().parse().unwrap(),
         Instant::now() + Duration::from_secs(ttl),
         cancelled,
@@ -442,13 +538,27 @@ mod tests {
     #[test]
     fn selects_audio_only_and_rejects_unsafe_urls_and_cipher_only_formats() {
         let data = json!({"playabilityStatus":{"status":"OK"},"streamingData":{"expiresInSeconds":"3600","adaptiveFormats":[{"mimeType":"video/mp4","url":"https://r.googlevideo.com/video","bitrate":900000,"contentLength":"10"},{"mimeType":"audio/webm","url":"https://r.googlevideo.com/audio","bitrate":120000,"contentLength":"100"},{"mimeType":"audio/mp4","signatureCipher":"x","bitrate":200000,"contentLength":"100"}]}});
-        let stream = parse_stream(&data, "hTWKbfoikeg", Arc::new(AtomicBool::new(false))).unwrap();
+        let stream = parse_stream(
+            &data,
+            "hTWKbfoikeg",
+            Arc::new(AtomicBool::new(false)),
+            USER_AGENT,
+        )
+        .unwrap();
         assert_eq!(stream.url, "https://r.googlevideo.com/audio");
         assert_eq!(stream.length, 100);
         let mut expired = data.clone();
         expired["streamingData"]["adaptiveFormats"][1]["url"] =
             json!("https://r.googlevideo.com/audio?expire=1");
-        assert!(parse_stream(&expired, "hTWKbfoikeg", Arc::new(AtomicBool::new(false))).is_err());
+        assert!(
+            parse_stream(
+                &expired,
+                "hTWKbfoikeg",
+                Arc::new(AtomicBool::new(false)),
+                USER_AGENT
+            )
+            .is_err()
+        );
         assert!(stream.expires.duration_since(Instant::now()) < Duration::from_secs(3600));
         for url in [
             "https://googlevideo.com.evil/x",
@@ -505,6 +615,17 @@ mod tests {
         assert!(Arc::ptr_eq(&state.entries["c"], &c));
         assert!(!c.cancelled.load(Ordering::Relaxed));
         assert!(state.entries["a"].cancelled.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn player_clients_have_distinct_contexts_and_user_agents() {
+        assert_eq!(CLIENTS.len(), 3);
+        for client in &CLIENTS {
+            let context = client_context(client, "visitor");
+            assert_eq!(context["clientName"], json!(client.name));
+            assert_eq!(context["clientVersion"], json!(client.version));
+            assert!(!client.user_agent.is_empty());
+            assert!(!client.header_name.is_empty());
+        }
     }
     #[test]
     fn speculative_jobs_leave_the_foreground_worker_free_and_cache_is_bounded() {

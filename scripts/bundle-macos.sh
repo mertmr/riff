@@ -27,6 +27,11 @@ cat > "$bundle/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleIconFile</key><string>Riff.icns</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>MallocLargeCache</key><string>0</string>
+    <key>MallocAggressiveMadvise</key><string>1</string>
+  </dict>
 </dict>
 </plist>
 PLIST

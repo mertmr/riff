@@ -1,8 +1,9 @@
 //! Resolution-independent icons with consistent strokes and optical sizes.
-use eframe::egui::{self, Color32, Painter, Rect, Shape, Stroke, pos2};
+use egui::{self, Color32, Painter, Rect, Shape, Stroke, pos2};
 
 #[derive(Clone, Copy)]
 pub enum Icon {
+    Bell,
     Home,
     Search,
     Library,
@@ -19,6 +20,8 @@ pub enum Icon {
     More,
     Up,
     Down,
+    ChevronLeft,
+    ChevronRight,
     Trash,
     Music,
     Check,
@@ -47,6 +50,23 @@ pub fn paint(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
         ));
     };
     match icon {
+        Icon::Bell => {
+            path(&[
+                (4., 18.),
+                (6., 15.),
+                (6., 9.),
+                (7., 6.),
+                (10., 4.),
+                (14., 4.),
+                (17., 6.),
+                (18., 9.),
+                (18., 15.),
+                (20., 18.),
+                (4., 18.),
+            ]);
+            p.circle_filled(pt(12., 2.), r.width() / 16., color);
+            path(&[(10., 21.), (12., 22.), (14., 21.)]);
+        }
         Icon::Radio => {
             p.circle_filled(pt(12., 12.), r.width() / 10., color);
             for x in [5., 1.] {
@@ -157,6 +177,8 @@ pub fn paint(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
         }
         Icon::Up => path(&[(6., 15.), (12., 9.), (18., 15.)]),
         Icon::Down => path(&[(6., 9.), (12., 15.), (18., 9.)]),
+        Icon::ChevronLeft => path(&[(15., 6.), (9., 12.), (15., 18.)]),
+        Icon::ChevronRight => path(&[(9., 6.), (15., 12.), (9., 18.)]),
         Icon::Trash => {
             line((4., 6.), (20., 6.));
             path(&[(8., 6.), (8., 3.), (16., 3.), (16., 6.)]);

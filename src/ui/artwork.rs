@@ -2,7 +2,7 @@
 //! compressed bytes and decoded pixels are released as soon as they're uploaded.
 use super::{icons::Icon, widgets};
 use crate::model::{Track, is_valid_video_id};
-use eframe::egui::{self, ColorImage, Rect, TextureHandle, TextureOptions, Ui, pos2};
+use egui::{self, ColorImage, Rect, TextureHandle, TextureOptions, Ui, pos2};
 use std::{
     collections::HashMap,
     fs,
@@ -37,6 +37,7 @@ struct Job {
     id: String,
     ticket: u64,
     url: String,
+    size: u32,
     ctx: egui::Context,
 }
 struct Loaded {
@@ -45,6 +46,7 @@ struct Loaded {
     image: Option<ColorImage>,
 }
 pub struct Artwork {
+    hero: Option<TextureHandle>,
     entries: HashMap<String, Entry>,
     clock: u64,
     next_ticket: u64,
@@ -86,7 +88,8 @@ impl Default for Artwork {
                         if shutdown.load(Ordering::Relaxed) {
                             break;
                         }
-                        let image = fetch_image(&agent, dir.as_deref(), &job.id, &job.url).ok();
+                        let image =
+                            fetch_image(&agent, dir.as_deref(), &job.id, &job.url, job.size).ok();
                         if shutdown.load(Ordering::Relaxed) {
                             break;
                         }
@@ -106,6 +109,7 @@ impl Default for Artwork {
                 .expect("couldn't start artwork worker");
         }
         Self {
+            hero: None,
             entries: HashMap::new(),
             clock: 0,
             next_ticket: 0,
@@ -158,6 +162,40 @@ impl Artwork {
             ctx.request_repaint();
         }
     }
+    pub fn paint_hero(&mut self, ui: &Ui, rect: Rect) {
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let texture = self.hero.get_or_insert_with(|| {
+            let image =
+                image::load_from_memory(include_bytes!("../../assets/images/music-hero.jpg"))
+                    .expect("bundled music hero must be a valid JPEG")
+                    .into_rgba8();
+            ui.ctx().load_texture(
+                "music-hero",
+                ColorImage::from_rgba_unmultiplied(
+                    [image.width() as usize, image.height() as usize],
+                    image.as_raw(),
+                ),
+                TextureOptions::LINEAR,
+            )
+        });
+        let source = texture.size_vec2();
+        let visible = (source.x / source.y) / rect.aspect_ratio();
+        let uv = if visible <= 1. {
+            Rect::from_min_max(pos2(0., 0.), pos2(1., visible))
+        } else {
+            Rect::from_min_max(pos2(0., 0.), pos2(1. / visible, 1.))
+        };
+        egui::Image::from_texture(&*texture)
+            .uv(uv)
+            .corner_radius(12)
+            .paint_at(ui, rect);
+    }
+    pub fn paint_profile(&mut self, ui: &Ui, url: &str, rect: Rect) -> bool {
+        let id = format!("profile:{url}");
+        self.paint_url(ui, &id, url, rect, 18)
+    }
     pub fn paint(&mut self, ui: &Ui, track: &Track, rect: Rect, radius: u8) {
         if !is_valid_video_id(&track.id) {
             widgets::placeholder(ui, rect, radius, Icon::Music);
@@ -171,13 +209,15 @@ impl Artwork {
             radius,
         );
     }
-    pub fn paint_url(&mut self, ui: &Ui, id: &str, url: &str, rect: Rect, radius: u8) {
+    pub fn paint_url(&mut self, ui: &Ui, id: &str, url: &str, rect: Rect, radius: u8) -> bool {
         self.receive(ui.ctx());
         if !ui.is_rect_visible(rect) {
-            return;
+            return false;
         }
+        let size = artwork_size(rect.width().max(rect.height()), ui.ctx().pixels_per_point());
+        let id = format!("{id}:{size}");
         self.clock = self.clock.wrapping_add(1);
-        let retry = self.entries.get(id).is_none_or(
+        let retry = self.entries.get(&id).is_none_or(
             |entry| matches!(entry.state, State::Failed(until) if Instant::now() >= until),
         );
         if retry && valid_artwork_url(url) {
@@ -185,15 +225,16 @@ impl Artwork {
             if self
                 .jobs
                 .try_send(Job {
-                    id: id.to_owned(),
+                    id: id.clone(),
                     ticket: self.next_ticket,
-                    url: url.to_owned(),
+                    url: sized_artwork_url(url, size),
+                    size,
                     ctx: ui.ctx().clone(),
                 })
                 .is_ok()
             {
                 self.entries.insert(
-                    id.to_owned(),
+                    id.clone(),
                     Entry {
                         state: State::Pending,
                         used: self.clock,
@@ -203,9 +244,9 @@ impl Artwork {
                 );
             }
         }
-        let Some(entry) = self.entries.get_mut(id) else {
+        let Some(entry) = self.entries.get_mut(&id) else {
             widgets::placeholder(ui, rect, radius, Icon::Music);
-            return;
+            return false;
         };
         entry.used = self.clock;
         if let State::Ready(texture) = &entry.state {
@@ -221,8 +262,10 @@ impl Artwork {
                 .uv(uv)
                 .corner_radius(radius)
                 .paint_at(ui, rect);
+            true
         } else {
             widgets::placeholder(ui, rect, radius, Icon::Music);
+            false
         }
     }
     pub fn trim(&mut self, ctx: &egui::Context) {
@@ -259,11 +302,57 @@ fn valid_artwork_url(url: &str) -> bool {
     .any(|host| url.starts_with(host))
 }
 
+fn artwork_size(points: f32, pixels_per_point: f32) -> u32 {
+    let pixels = points * pixels_per_point;
+    // Small list/player covers don't need the same allocation as album cards.
+    // Leave room for cropping a 16:9 video thumbnail into a square cover.
+    if pixels <= 72. {
+        128
+    } else if pixels <= 144. {
+        256
+    } else if pixels <= 320. {
+        320
+    } else {
+        640
+    }
+}
+
+fn sized_artwork_url(url: &str, size: u32) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.into();
+    };
+    if !matches!(
+        parsed.host_str(),
+        Some("yt3.googleusercontent.com" | "lh3.googleusercontent.com" | "yt3.ggpht.com")
+    ) {
+        return url.into();
+    }
+    let Some((image, options)) = parsed.path().rsplit_once('=') else {
+        return url.into();
+    };
+    let dimension = |option: &str| {
+        option.len() > 1
+            && matches!(option.as_bytes()[0], b'w' | b'h' | b's')
+            && option.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+    };
+    if !options.split('-').any(dimension) {
+        return url.into();
+    }
+    let mut path = format!("{image}=w{size}-h{size}");
+    for option in options.split('-').filter(|option| !dimension(option)) {
+        path.push('-');
+        path.push_str(option);
+    }
+    parsed.set_path(&path);
+    parsed.into()
+}
+
 fn fetch_image(
     agent: &ureq::Agent,
     dir: Option<&Path>,
     id: &str,
     url: &str,
+    size: u32,
 ) -> Result<ColorImage, String> {
     if !valid_artwork_url(url) {
         return Err("Invalid artwork URL".into());
@@ -272,19 +361,14 @@ fn fetch_image(
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
-    let path = dir.map(|dir| {
-        dir.join(if is_valid_video_id(id) {
-            format!("{id}.jpg")
-        } else {
-            format!("{:016x}.jpg", hasher.finish())
-        })
-    });
+    url.hash(&mut hasher);
+    let path = dir.map(|dir| dir.join(format!("{:016x}.jpg", hasher.finish())));
     if let Some(path) = &path
         && let Ok(file) = fs::File::open(path)
     {
         let mut bytes = Vec::new();
         if file.take(MAX_DOWNLOAD + 1).read_to_end(&mut bytes).is_ok()
-            && let Ok(image) = decode(&bytes)
+            && let Ok(image) = decode(&bytes, size)
         {
             return Ok(image);
         }
@@ -298,7 +382,7 @@ fn fetch_image(
         .limit(MAX_DOWNLOAD)
         .read_to_vec()
         .map_err(|e| e.to_string())?;
-    let image = decode(&bytes)?;
+    let image = decode(&bytes, size)?;
     if let (Some(dir), Some(path)) = (dir, path)
         && fs::create_dir_all(dir).is_ok()
     {
@@ -310,7 +394,7 @@ fn fetch_image(
     }
     Ok(image)
 }
-fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
+fn decode(bytes: &[u8], size: u32) -> Result<ColorImage, String> {
     if bytes.len() as u64 > MAX_DOWNLOAD {
         return Err("artwork exceeds download limit".into());
     }
@@ -323,7 +407,7 @@ fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
     limits.max_alloc = Some(4 * 1024 * 1024);
     reader.limits(limits);
     let decoded = reader.decode().map_err(|e| e.to_string())?;
-    let rgba = decoded.thumbnail(320, 320).to_rgba8();
+    let rgba = decoded.thumbnail(size, size).to_rgba8();
     Ok(ColorImage::from_rgba_unmultiplied(
         [rgba.width() as usize, rgba.height() as usize],
         rgba.as_raw(),
@@ -374,11 +458,112 @@ mod tests {
 
     #[test]
     fn artwork_decoding_limits_dimensions_and_preserves_aspect_ratio() {
-        let image = decode(&png(800, 600)).unwrap();
+        let image = decode(&png(800, 600), 320).unwrap();
         assert_eq!(image.size, [320, 240]);
-        assert!(decode(&png(1025, 1)).is_err());
-        assert!(decode(b"not an image").is_err());
-        assert!(decode(&vec![0; MAX_DOWNLOAD as usize + 1]).is_err());
+        let large = decode(&png(800, 600), 640).unwrap();
+        assert_eq!(large.size, [640, 480]);
+        assert_eq!(decode(&png(640, 640), 640).unwrap().size, [640, 640]);
+        assert!(decode(&png(1025, 1), 640).is_err());
+        assert!(decode(b"not an image", 640).is_err());
+        assert!(decode(&vec![0; MAX_DOWNLOAD as usize + 1], 640).is_err());
+    }
+
+    #[test]
+    fn album_artwork_requests_account_for_display_scale_and_preserve_url_options() {
+        assert_eq!(artwork_size(64., 1.), 128);
+        assert_eq!(artwork_size(64., 2.), 256);
+        assert_eq!(artwork_size(220., 1.), 320);
+        assert_eq!(artwork_size(220., 2.), 640);
+        assert_eq!(artwork_size(1000., 2.), 640);
+        for host in [
+            "yt3.googleusercontent.com",
+            "lh3.googleusercontent.com",
+            "yt3.ggpht.com",
+        ] {
+            assert_eq!(
+                sized_artwork_url(&format!("https://{host}/cover=w120-h120-l90-rj"), 640),
+                format!("https://{host}/cover=w640-h640-l90-rj")
+            );
+            assert_eq!(
+                sized_artwork_url(&format!("https://{host}/avatar=s88-c-k?token=test"), 320),
+                format!("https://{host}/avatar=w320-h320-c-k?token=test")
+            );
+        }
+        for url in [
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg",
+            "https://yt3.googleusercontent.com/cover",
+            "https://yt3.googleusercontent.com/cover=unknown",
+            "https://example.com/cover=w120-h120",
+        ] {
+            assert_eq!(sized_artwork_url(url, 640), url);
+        }
+    }
+
+    #[test]
+    fn large_album_artwork_does_not_reuse_a_small_cached_texture() {
+        let ctx = egui::Context::default();
+        let (jobs, requests) = mpsc::sync_channel(8);
+        let (done, results) = mpsc::sync_channel(4);
+        let mut cache = Artwork {
+            hero: None,
+            entries: HashMap::new(),
+            clock: 0,
+            next_ticket: 0,
+            retained: 0,
+            jobs,
+            results,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let url = "https://yt3.googleusercontent.com/cover=w120-h120-l90-rj";
+        let render = |cache: &mut Artwork, edge| {
+            let mut ready = false;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800., 800.),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    ready = cache.paint_url(
+                        ui,
+                        "album",
+                        url,
+                        Rect::from_min_size(pos2(20., 20.), egui::vec2(edge, edge)),
+                        8,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            ready
+        };
+        assert!(!render(&mut cache, 64.));
+        let small = requests.try_recv().unwrap();
+        assert_eq!(small.size, 128);
+        done.send(Loaded {
+            id: small.id.clone(),
+            ticket: small.ticket,
+            image: Some(ColorImage::filled([128, 128], egui::Color32::BLACK)),
+        })
+        .unwrap();
+        assert!(render(&mut cache, 64.));
+        assert!(requests.try_recv().is_err());
+        assert!(!render(&mut cache, 440.));
+        let large = requests.try_recv().unwrap();
+        assert_eq!(large.size, 640);
+        assert_ne!(large.id, small.id);
+        assert_ne!(large.url, small.url);
+        done.send(Loaded {
+            id: large.id.clone(),
+            ticket: large.ticket,
+            image: Some(ColorImage::filled([640, 640], egui::Color32::BLACK)),
+        })
+        .unwrap();
+        assert!(render(&mut cache, 440.));
+        assert!(render(&mut cache, 64.));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(cache.retained, (128 * 128 + 640 * 640) * 4);
     }
 
     #[test]

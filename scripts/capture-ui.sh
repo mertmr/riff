@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Captures the real native wgpu renderer. Fixtures are isolated from saved collections.
+# Captures the real native renderer. Fixtures are isolated from saved collections.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build --features ui-qa

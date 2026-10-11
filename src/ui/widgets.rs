@@ -4,12 +4,66 @@ use super::{
     theme::*,
 };
 use crate::{app::Action, model::Track};
-use eframe::egui::{
-    self, Color32, FontId, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2,
-};
+use egui::{self, Color32, FontId, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2};
+
+pub fn gradient(p: &egui::Painter, rect: Rect, radius: f32, left: Color32, right: Color32) {
+    let radius = radius.min(rect.width() / 2.).min(rect.height() / 2.);
+    let color_at = |x: f32| {
+        let t = ((x - rect.left()) / rect.width()).clamp(0., 1.);
+        let a = left.to_array();
+        let b = right.to_array();
+        Color32::from_rgba_unmultiplied(
+            (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t) as u8,
+            (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t) as u8,
+            (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t) as u8,
+            (a[3] as f32 + (b[3] as f32 - a[3] as f32) * t) as u8,
+        )
+    };
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.center(), color_at(rect.center().x));
+    for (center, start) in [
+        (
+            rect.right_top() + vec2(-radius, radius),
+            -std::f32::consts::FRAC_PI_2,
+        ),
+        (rect.right_bottom() - vec2(radius, radius), 0.),
+        (
+            rect.left_bottom() + vec2(radius, -radius),
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (rect.left_top() + vec2(radius, radius), std::f32::consts::PI),
+    ] {
+        for step in 0..=8 {
+            let angle = start + step as f32 * std::f32::consts::FRAC_PI_2 / 8.;
+            let point = center + vec2(angle.cos(), angle.sin()) * radius;
+            mesh.colored_vertex(point, color_at(point.x));
+        }
+    }
+    let count = mesh.vertices.len() as u32;
+    for i in 1..count {
+        mesh.add_triangle(0, i, if i + 1 == count { 1 } else { i + 1 });
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
+pub fn glow(p: &egui::Painter, center: egui::Pos2, radius: f32) {
+    for i in (1..=5).rev() {
+        p.circle_filled(
+            center,
+            radius + i as f32 * 3.,
+            Color32::from_rgba_unmultiplied(255, 32, 76, 5 + (5 - i) * 3),
+        );
+    }
+}
 
 pub fn placeholder(ui: &Ui, rect: Rect, radius: u8, icon: Icon) {
-    ui.painter().rect_filled(rect, radius, HOVER);
+    gradient(ui.painter(), rect, radius as f32, SURFACE, HOVER);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1., LINE),
+        egui::StrokeKind::Inside,
+    );
     icons::paint(
         ui.painter(),
         icon,
@@ -46,20 +100,20 @@ pub fn button(ui: &mut Ui, text: &str, primary: bool) -> Response {
     ui.scope(|ui| {
         let v = ui.visuals_mut();
         v.widgets.inactive.weak_bg_fill = if primary { ACCENT } else { HOVER };
-        v.widgets.hovered.weak_bg_fill = if primary { TEXT } else { LINE };
+        v.widgets.hovered.weak_bg_fill = if primary {
+            Color32::from_rgb(255, 65, 105)
+        } else {
+            LINE
+        };
         v.widgets.active.weak_bg_fill = if primary {
             ACCENT.gamma_multiply(0.9)
         } else {
             ACTIVE
         };
         ui.add(
-            egui::Button::new(
-                RichText::new(text)
-                    .color(if primary { SIDEBAR } else { TEXT })
-                    .font(bold(14.)),
-            )
-            .stroke(Stroke::NONE)
-            .corner_radius(20),
+            egui::Button::new(RichText::new(text).color(TEXT).font(bold(14.)))
+                .stroke(Stroke::new(1., if primary { ACCENT } else { LINE }))
+                .corner_radius(20),
         )
     })
     .inner
@@ -90,7 +144,7 @@ pub fn icon_button(
     let color = if !enabled {
         DIM
     } else if filled {
-        SIDEBAR
+        TEXT
     } else if active {
         ACCENT
     } else if hovered {
@@ -99,10 +153,18 @@ pub fn icon_button(
         MUTED
     };
     if filled {
+        if enabled {
+            glow(ui.painter(), rect.center(), rect.width() / 2.);
+        }
         ui.painter().circle_filled(
             rect.center(),
             rect.width() / 2.,
-            if hovered { TEXT } else { ACCENT },
+            if hovered { ACTIVE } else { SIDEBAR },
+        );
+        ui.painter().circle_stroke(
+            rect.center(),
+            rect.width() / 2.,
+            Stroke::new(1.8, if enabled { ACCENT } else { DIM }),
         );
     } else if hovered {
         ui.painter().rect_filled(rect, 8, HOVER);
@@ -309,14 +371,6 @@ pub fn slider(
         ui.painter()
             .circle_filled(pos2(rect.left() + rect.width() * ratio as f32, y), 5., TEXT);
     }
-    if response.has_focus() {
-        ui.painter().rect_stroke(
-            rect.expand(2.),
-            6,
-            Stroke::new(1., ACCENT),
-            egui::StrokeKind::Inside,
-        );
-    }
     if enabled {
         response
             .clone()
@@ -332,7 +386,7 @@ pub fn slider(
             format!("{label}: {}", time(next))
         }
     } else {
-        "Available once audio is ready".into()
+        format!("{label} unavailable")
     });
     if enabled
         && ((response.clicked() || response.drag_stopped() || (!commit && dragged))
@@ -360,11 +414,23 @@ pub struct Row<'a> {
     pub liked: bool,
     pub selected: bool,
     pub queue: bool,
+    pub collection: bool,
     pub radio: bool,
     pub queue_range: std::ops::Range<usize>,
     pub saved: bool,
     pub queue_revision: u64,
     pub playlist: Option<(u64, u64)>,
+}
+impl Row<'_> {
+    fn play_action(&self) -> Action {
+        if self.queue {
+            Action::QueuePlay(self.index)
+        } else if self.collection {
+            Action::PlayCollectionTrack(self.index)
+        } else {
+            Action::Play(self.track.clone())
+        }
+    }
 }
 pub fn track_row(ui: &mut Ui, art: &mut Artwork, row: Row<'_>, actions: &mut Vec<Action>) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 64.), Sense::hover());
@@ -468,10 +534,8 @@ pub fn track_row(ui: &mut Ui, art: &mut Artwork, row: Row<'_>, actions: &mut Vec
     if play.clicked() {
         actions.push(if row.current {
             Action::TogglePlayback
-        } else if row.queue {
-            Action::QueuePlay(row.index)
         } else {
-            Action::Play(row.track.clone())
+            row.play_action()
         });
     }
     let more = Rect::from_min_size(pos2(rect.right() - 40., rect.top() + 12.), vec2(32., 40.));
@@ -536,7 +600,7 @@ pub fn track_row(ui: &mut Ui, art: &mut Artwork, row: Row<'_>, actions: &mut Vec
             actions.push(if row.current {
                 Action::TogglePlayback
             } else {
-                Action::Play(row.track.clone())
+                row.play_action()
             });
         }
     }
@@ -546,11 +610,7 @@ pub fn track_row(ui: &mut Ui, art: &mut Artwork, row: Row<'_>, actions: &mut Vec
     let menu = |ui: &mut Ui, actions: &mut Vec<Action>| {
         ui.set_min_width(184.);
         if ui.button("Play now").clicked() {
-            actions.push(if row.queue {
-                Action::QueuePlay(row.index)
-            } else {
-                Action::Play(row.track.clone())
-            });
+            actions.push(row.play_action());
             ui.close();
         }
         if ui.button("Start song radio").clicked() {
@@ -759,6 +819,7 @@ mod tests {
                                     liked: false,
                                     selected: false,
                                     queue,
+                                    collection: !queue,
                                     radio: false,
                                     queue_range: 0..3,
                                     saved: false,

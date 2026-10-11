@@ -4,7 +4,6 @@ use crate::{
     model::{Collection, CollectionKind, Playlist, SavedAlbum, Track},
     radio::Radio,
 };
-use eframe::egui;
 use std::{
     path::PathBuf,
     sync::{
@@ -27,15 +26,15 @@ pub fn finish_first_ui(ctx: &egui::Context) {
         && let Some(start) = START.get()
     {
         let _ = FIRST_UI_MS.set(start.elapsed().as_secs_f64() * 1000.0);
-        // The following logic call occurs after eframe has painted, presented,
+        // The following logic call occurs after the renderer has painted, presented,
         // and shown the first native frame. No screenshot readback is needed.
         ctx.request_repaint();
     }
 }
 
-pub fn report_startup(frame: &eframe::Frame) {
+pub fn report_startup(painted: bool) {
     if std::env::var_os("RIFF_QA_STARTUP").is_some()
-        && frame.info().cpu_usage.is_some()
+        && painted
         && let Some(first_ui_ms) = FIRST_UI_MS.get()
         && !REPORTED.swap(true, Ordering::Relaxed)
         && let Some(start) = START.get()
@@ -149,9 +148,50 @@ pub fn configure(app: &mut MusicApp) {
         app.queue.clear();
     }
     match std::env::var("RIFF_VIEW").as_deref() {
+        Ok(
+            "account" | "account-connected" | "account-playlist" | "account-error"
+            | "account-loading",
+        ) => {
+            app.view = View::Account;
+            app.account.config = Default::default();
+            if std::env::var("RIFF_VIEW").is_ok_and(|v| v == "account-loading") {
+                app.account.loading = true;
+            }
+            if std::env::var("RIFF_VIEW").is_ok_and(|v| v == "account-error") {
+                app.account.error =
+                    Some("Google sign-in expired. Disconnect and sign in again.".into());
+            }
+            if std::env::var("RIFF_VIEW")
+                .is_ok_and(|v| matches!(v.as_str(), "account-connected" | "account-playlist"))
+            {
+                let playlist = Collection {
+                    id: "PL-private-fixture".into(),
+                    title: "My private evening mix".into(),
+                    subtitle: "8 videos".into(),
+                    kind: CollectionKind::Playlist,
+                    thumbnail: None,
+                    params: None,
+                };
+                app.account.library = Some(crate::account::Library {
+                    name: "Riff listener".into(),
+                    picture: None,
+                    likes: app.results.clone(),
+                    subscriptions: app.artists.clone(),
+                    playlists: vec![playlist.clone()],
+                });
+                if std::env::var("RIFF_VIEW").is_ok_and(|v| v == "account-playlist") {
+                    app.account.playlist =
+                        Some((playlist, crate::catalog::Page::from(app.results.clone())));
+                }
+            }
+        }
         Ok("home-loading") => {
             app.recommendations.tracks.clear();
             app.recommendations.searching = true;
+        }
+        Ok("home-refreshing") => app.recommendations.searching = true,
+        Ok("home-refresh-error") => {
+            app.recommendations.error = Some("Check your connection and try again.".into())
         }
         Ok("home-error") => {
             app.recommendations.tracks.clear();

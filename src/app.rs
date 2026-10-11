@@ -1,5 +1,6 @@
 //! Application state and effects. Rendering emits actions; workers never touch UI state.
 use crate::{
+    account::{self, Request as AccountRequest, Response as AccountResponse},
     catalog::{self, Page, SearchFilter},
     model::{Collection, CollectionKind, Playlist, SavedAlbum, Track, move_item},
     player::{self, PlaybackEvent, PlayerCommand, PlayerEvent},
@@ -8,7 +9,6 @@ use crate::{
     storage::{self, LibraryWriter, Session},
     ui,
 };
-use eframe::egui;
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
@@ -31,6 +31,7 @@ pub enum View {
     Artists,
     Playlists,
     Collection,
+    Account,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Playback {
@@ -50,12 +51,21 @@ pub enum LibraryTab {
 }
 
 pub enum Action {
+    ConnectAccount,
+    RefreshAccount,
+    DisconnectAccount,
+    AccountTab(account::Tab),
+    AccountPlaylist(Collection),
+    AccountMore,
+    AccountBack,
+    AccountSearch(String),
     Navigate(View),
     Search,
     CancelSearch,
     FocusSearch,
     Select(usize),
     Play(Track),
+    PlayCollectionTrack(usize),
     StartRadio(Track),
     StopRadio,
     RetryRadio,
@@ -76,6 +86,7 @@ pub enum Action {
     Volume(u8),
     Mute,
     Seek(f64),
+    SetCacheAudio(bool),
     PlayFavorites,
     RefreshLibrary,
     LibraryTab(LibraryTab),
@@ -185,7 +196,6 @@ impl Recommendations {
     fn complete(&mut self, result: Result<Vec<Track>, String>, known: &[Track]) {
         self.searching = false;
         self.error = None;
-        self.tracks.clear();
         match result {
             Ok(tracks) => {
                 let mut seen: HashSet<&str> = known.iter().map(|t| t.id.as_str()).collect();
@@ -205,6 +215,7 @@ impl Recommendations {
 }
 
 pub struct MusicApp {
+    pub account: account::State,
     pub query: String,
     pub submitted_query: String,
     pub results: Vec<Track>,
@@ -232,6 +243,7 @@ pub struct MusicApp {
     pub library_tab: LibraryTab,
     pub queue: VecDeque<Track>,
     pub radio: Option<Radio>,
+    auto_radio: bool,
     pub recommendations: Recommendations,
     pub current: Option<Track>,
     history: Vec<Track>,
@@ -252,6 +264,7 @@ pub struct MusicApp {
     pub seekable: bool,
     pub volume: u8,
     unmuted_volume: u8,
+    pub cache_audio: bool,
     pub playback_error: Option<String>,
     pub global_error: Option<String>,
     pub notice: Option<Notice>,
@@ -282,12 +295,21 @@ pub struct MusicApp {
     pub qa: Option<crate::qa::Capture>,
 }
 impl MusicApp {
+    #[cfg(not(target_os = "macos"))]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::from_context(&cc.egui_ctx)
     }
-    fn from_context(ctx: &egui::Context) -> Self {
+    pub(crate) fn from_context(ctx: &egui::Context) -> Self {
         let (favorites, session, global_error) = storage::load_library();
-        Self::from_library(ctx, favorites, session, global_error)
+        let mut app = Self::from_library(ctx, favorites, session, global_error);
+        #[cfg(feature = "ui-qa")]
+        let restore = app.qa.is_none();
+        #[cfg(not(feature = "ui-qa"))]
+        let restore = true;
+        if restore {
+            app.request_account(AccountRequest::Restore);
+        }
+        app
     }
     fn from_library(
         ctx: &egui::Context,
@@ -347,13 +369,25 @@ impl MusicApp {
         let radio_epoch = Arc::new(AtomicU64::new(0));
         let cancellation = radio_epoch.clone();
         thread::spawn(move || {
+            let client = catalog::Client::new();
             while let Ok(mut job) = jobs.recv() {
                 while let Ok(newer) = jobs.try_recv() {
                     job = newer;
                 }
-                let result = search::radio_youtube(&job.query, || {
-                    cancellation.load(Ordering::Relaxed) != job.token
+                if cancellation.load(Ordering::Relaxed) != job.token {
+                    continue;
+                }
+                let result = client.recommendations(&job.query).or_else(|error| {
+                    if cancellation.load(Ordering::Relaxed) != job.token {
+                        return Err(error);
+                    }
+                    search::radio_youtube(&job.query, || {
+                        cancellation.load(Ordering::Relaxed) != job.token
+                    })
                 });
+                if cancellation.load(Ordering::Relaxed) != job.token {
+                    continue;
+                }
                 let _ = result_tx.send(SearchResult {
                     token: job.token,
                     result,
@@ -368,13 +402,18 @@ impl MusicApp {
         let recommendation_epoch = Arc::new(AtomicU64::new(0));
         let cancellation = recommendation_epoch.clone();
         thread::spawn(move || {
+            let client = catalog::Client::new();
             while let Ok(mut job) = jobs.recv() {
                 while let Ok(newer) = jobs.try_recv() {
                     job = newer;
                 }
-                let result = search::radio_youtube(&job.query, || {
-                    cancellation.load(Ordering::Relaxed) != job.token
-                });
+                if cancellation.load(Ordering::Relaxed) != job.token {
+                    continue;
+                }
+                let result = client.recommendations(&job.query);
+                if cancellation.load(Ordering::Relaxed) != job.token {
+                    continue;
+                }
                 let _ = result_tx.send(SearchResult {
                     token: job.token,
                     result,
@@ -383,6 +422,7 @@ impl MusicApp {
             }
         });
         let mut app = Self {
+            account: account::State::new(ctx.clone()),
             query: String::new(),
             submitted_query: String::new(),
             results: Vec::new(),
@@ -410,6 +450,7 @@ impl MusicApp {
             library_tab: LibraryTab::All,
             queue: session.queue.into(),
             radio: None,
+            auto_radio: true,
             recommendations: Recommendations::default(),
             current: session.current.clone(),
             history: Vec::new(),
@@ -434,6 +475,7 @@ impl MusicApp {
             seekable: false,
             volume: session.volume,
             unmuted_volume: session.volume.max(1),
+            cache_audio: session.cache_audio,
             playback_error: None,
             global_error,
             notice: None,
@@ -465,6 +507,9 @@ impl MusicApp {
         };
         app.rebuild_library();
         let _ = app.player_tx.send(PlayerCommand::SetVolume(app.volume));
+        let _ = app
+            .player_tx
+            .send(PlayerCommand::SetCacheEnabled(app.cache_audio));
         #[cfg(feature = "ui-qa")]
         crate::qa::configure(&mut app);
         app
@@ -481,6 +526,17 @@ impl MusicApp {
                 .and_then(|id| self.playlists.iter().find(|p| p.id == id))
                 .map_or(&self.detail.tracks, |p| &p.tracks),
             View::Albums | View::Artists | View::Playlists => &[],
+            View::Account => self
+                .account
+                .playlist
+                .as_ref()
+                .map(|(_, p)| p.tracks.as_slice())
+                .or_else(|| {
+                    (self.account.tab == account::Tab::Likes)
+                        .then(|| self.account.library.as_ref().map(|l| l.likes.as_slice()))
+                        .flatten()
+                })
+                .unwrap_or_default(),
             View::Home if !self.recommendations.tracks.is_empty() => &self.recommendations.tracks,
             View::Home => &self.recent[..self.recent.len().min(12)],
         }
@@ -509,6 +565,7 @@ impl MusicApp {
                 recent: self.recent.clone(),
                 queue: self.queue.iter().cloned().collect(),
                 volume: self.volume,
+                cache_audio: self.cache_audio,
                 current: self.current.clone(),
                 position: self.position,
                 saved_tracks: snapshot.tracks.clone(),
@@ -540,6 +597,13 @@ impl MusicApp {
                 .chain(
                     self.saved_tracks
                         .iter()
+                        .filter(|_| self.library_tab != LibraryTab::Recent),
+                )
+                .chain(
+                    self.account
+                        .library
+                        .iter()
+                        .flat_map(|l| &l.likes)
                         .filter(|_| self.library_tab != LibraryTab::Recent),
                 )
                 .chain(
@@ -842,6 +906,16 @@ impl MusicApp {
             self.queue_selected = None;
             self.persist();
         } else {
+            if self.auto_radio
+                && self.radio.is_none()
+                && let Some(seed) = self.current.clone()
+            {
+                let mut radio = Radio::new(seed);
+                for track in self.history.iter().chain(&self.recent) {
+                    radio.remember(&track.id);
+                }
+                self.radio = Some(radio);
+            }
             self.generation = self.generation.wrapping_add(1);
             let _ = self.player_tx.send(PlayerCommand::Stop);
             self.playback = Playback::Stopped;
@@ -861,7 +935,16 @@ impl MusicApp {
         self.queue_selected = None;
     }
     fn recommendation_seed(&self) -> Option<Track> {
-        self.recent.first().or(self.favorites.first()).cloned()
+        self.recent
+            .first()
+            .or_else(|| {
+                self.account
+                    .library
+                    .as_ref()
+                    .and_then(account::Library::seed)
+            })
+            .or(self.favorites.first())
+            .cloned()
     }
     fn refresh_recommendations(&mut self, force: bool) {
         #[cfg(feature = "ui-qa")]
@@ -869,20 +952,21 @@ impl MusicApp {
             return;
         }
         let seed = self.recommendation_seed();
-        if !force
-            && self.recommendations.seed.as_ref().map(|t| &t.id) == seed.as_ref().map(|t| &t.id)
-        {
+        let same_seed =
+            self.recommendations.seed.as_ref().map(|t| &t.id) == seed.as_ref().map(|t| &t.id);
+        if same_seed && (!force || self.recommendations.searching) {
             return;
         }
         self.recommendation_token = self.recommendation_token.wrapping_add(1);
         self.recommendation_epoch
             .store(self.recommendation_token, Ordering::Relaxed);
-        self.recommendations = Recommendations {
-            seed: seed.clone(),
-            ..Default::default()
+        let Some(seed) = seed else {
+            self.recommendations = Recommendations::default();
+            self.selected = None;
+            return;
         };
-        self.selected = None;
-        let Some(seed) = seed else { return };
+        self.recommendations.seed = Some(seed.clone());
+        self.recommendations.error = None;
         self.recommendations.searching = true;
         if self
             .recommendation_tx
@@ -955,7 +1039,33 @@ impl MusicApp {
         };
         index < self.queue_len() && target < self.queue_len()
     }
-    fn receive(&mut self) {
+    pub(crate) fn receive(&mut self) {
+        while let Ok(message) = self.account.worker.rx.try_recv() {
+            if message.token != self.account.worker.token {
+                continue;
+            }
+            self.account.loading = false;
+            match message.result {
+                Ok(AccountResponse::Library(library)) => {
+                    self.account.library = library;
+                    self.account.error = None;
+                    self.rebuild_library();
+                    self.refresh_recommendations(true);
+                }
+                Ok(AccountResponse::Playlist { id, append, page }) => {
+                    if let Some((collection, current)) = &mut self.account.playlist
+                        && collection.id == id
+                    {
+                        if append {
+                            current.append_collection(page);
+                        } else {
+                            *current = page;
+                        }
+                    }
+                }
+                Err(error) => self.account.error = Some(error),
+            }
+        }
         while let Ok(message) = self.recommendation_rx.try_recv() {
             if message.token != self.recommendation_token || self.recommendations.seed.is_none() {
                 continue;
@@ -964,12 +1074,16 @@ impl MusicApp {
                 .recent
                 .iter()
                 .chain(&self.favorites)
+                .chain(self.account.library.iter().flat_map(|l| &l.likes))
                 .chain(&self.queue)
                 .chain(self.current.iter())
                 .cloned()
                 .collect();
+            let refreshed = message.result.is_ok();
             self.recommendations.complete(message.result, &known);
-            self.selected = None;
+            if refreshed {
+                self.selected = None;
+            }
         }
         while let Ok(message) = self.radio_rx.try_recv() {
             self.queue_revision = self.queue_revision.wrapping_add(1);
@@ -1118,6 +1232,14 @@ impl MusicApp {
         }
         self.sync_next();
     }
+    fn request_account(&mut self, request: AccountRequest) {
+        self.account.error = None;
+        self.account.loading = true;
+        if let Err(error) = self.account.worker.request(request) {
+            self.account.error = Some(error);
+            self.account.loading = false;
+        }
+    }
     pub fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
         if matches!(
             &action,
@@ -1146,6 +1268,56 @@ impl MusicApp {
             self.queue_revision = self.queue_revision.wrapping_add(1);
         }
         match action {
+            Action::ConnectAccount => {
+                let config = if self.account.credentials_json.trim().is_empty() {
+                    Ok(self.account.config.clone())
+                } else {
+                    account::Config::from_json(&self.account.credentials_json)
+                };
+                match config {
+                    Ok(config) => {
+                        self.account.config = config.clone();
+                        self.account.credentials_json.clear();
+                        self.request_account(AccountRequest::Connect(config));
+                    }
+                    Err(error) => self.account.error = Some(error),
+                }
+            }
+            Action::RefreshAccount => self.request_account(AccountRequest::Refresh),
+            Action::DisconnectAccount => {
+                self.account.library = None;
+                self.account.playlist = None;
+                self.rebuild_library();
+                self.refresh_recommendations(true);
+                self.request_account(AccountRequest::Disconnect);
+            }
+            Action::AccountTab(tab) => {
+                self.account.tab = tab;
+                self.account.playlist = None;
+                self.selected = None;
+            }
+            Action::AccountBack => {
+                self.account.playlist = None;
+                self.selected = None;
+            }
+            Action::AccountSearch(query) => {
+                self.query = query;
+                self.dispatch(Action::Search, ctx);
+            }
+            Action::AccountPlaylist(collection) => {
+                let id = collection.id.clone();
+                self.account.playlist = Some((collection, Page::default()));
+                self.selected = None;
+                self.request_account(AccountRequest::Playlist(id, None));
+            }
+            Action::AccountMore => {
+                if let Some((collection, page)) = &self.account.playlist {
+                    self.request_account(AccountRequest::Playlist(
+                        collection.id.clone(),
+                        page.continuation.clone(),
+                    ));
+                }
+            }
             Action::Navigate(view) => {
                 self.cancel_catalog();
                 self.back_stack.clear();
@@ -1203,10 +1375,20 @@ impl MusicApp {
             }
             Action::Play(track) => {
                 self.stop_radio();
+                self.auto_radio = true;
                 self.play(track, true);
+            }
+            Action::PlayCollectionTrack(index) => {
+                if self.view == View::Collection
+                    && let Some(tracks) = self.active_tracks().get(index..)
+                    && !tracks.is_empty()
+                {
+                    self.dispatch(Action::PlayTracks(tracks.to_vec()), ctx);
+                }
             }
             Action::StartRadio(track) => {
                 self.stop_radio();
+                self.auto_radio = true;
                 self.radio = Some(Radio::new(track.clone()));
                 if self.current.as_ref().map(|t| &t.id) != Some(&track.id)
                     || !matches!(self.playback, Playback::Playing | Playback::Loading)
@@ -1218,6 +1400,7 @@ impl MusicApp {
             }
             Action::StopRadio => {
                 self.stop_radio();
+                self.auto_radio = false;
                 self.notify("Song radio stopped");
             }
             Action::RetryRadio => {
@@ -1247,6 +1430,7 @@ impl MusicApp {
                 }
                 Playback::Stopped | Playback::Error => {
                     if let Some(t) = self.current.clone() {
+                        self.auto_radio = true;
                         self.play_from(t, false, self.position);
                     }
                 }
@@ -1266,6 +1450,7 @@ impl MusicApp {
             Action::Next => self.next(),
             Action::Stop => {
                 self.stop_radio();
+                self.auto_radio = false;
                 self.generation = self.generation.wrapping_add(1);
                 let _ = self.player_tx.send(PlayerCommand::Stop);
                 self.playback = Playback::Stopped;
@@ -1304,6 +1489,7 @@ impl MusicApp {
             Action::QueuePlay(i) => {
                 let from_radio = i >= self.queue.len();
                 if let Some(track) = self.remove_queued(i) {
+                    self.auto_radio = true;
                     if from_radio && let Some(radio) = &mut self.radio {
                         radio.continuation = track.clone();
                     }
@@ -1366,16 +1552,32 @@ impl MusicApp {
                 }),
                 ctx,
             ),
+            Action::SetCacheAudio(enabled) => {
+                if self.cache_audio == enabled {
+                    return;
+                }
+                self.cache_audio = enabled;
+                let _ = self.player_tx.send(PlayerCommand::SetCacheEnabled(enabled));
+                ctx.request_repaint();
+                self.persist();
+            }
             Action::Seek(p) => {
                 if self.current.is_some() && p.is_finite() {
                     let max = self.effective_duration().unwrap_or(f64::MAX);
                     self.position = p.clamp(0., max);
-                    let _ = self.player_tx.send(PlayerCommand::Seek(p));
+                    if matches!(
+                        self.playback,
+                        Playback::Loading | Playback::Playing | Playback::Paused
+                    ) {
+                        let _ = self.player_tx.send(PlayerCommand::Seek(self.position));
+                    }
+                    self.persist();
                 }
             }
             Action::PlayFavorites => {
                 self.stop_radio();
                 if let Some(first) = self.favorites.first().cloned() {
+                    self.auto_radio = true;
                     self.queue = self.favorites.iter().skip(1).cloned().collect();
                     self.play(first, true);
                     self.persist();
@@ -1591,8 +1793,10 @@ impl MusicApp {
             Action::PlayTracks(tracks) => {
                 if let Some(first) = tracks.first().cloned() {
                     self.stop_radio();
+                    self.auto_radio = true;
                     self.queue = tracks.into_iter().skip(1).collect();
                     self.queue_revision = self.queue_revision.wrapping_add(1);
+                    self.queue_selected = None;
                     self.play(first, true);
                     self.persist();
                 }
@@ -1714,23 +1918,33 @@ impl MusicApp {
                 && let Some(i) = self.selected
                 && let Some(track) = self.active_tracks().get(i).cloned()
             {
-                self.dispatch(Action::Play(track), ctx);
+                self.dispatch(
+                    if self.view == View::Collection {
+                        Action::PlayCollectionTrack(i)
+                    } else {
+                        Action::Play(track)
+                    },
+                    ctx,
+                );
             }
         }
     }
     pub fn can_previous(&self) -> bool {
         !self.history.is_empty() || self.position > 3.
     }
-}
-impl eframe::App for MusicApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // eframe also calls logic for covered/minimized windows. Drain events
-        // and advance the queue there, without rendering or retaining a backlog.
-        self.receive();
-        #[cfg(feature = "ui-qa")]
-        crate::qa::report_startup(_frame);
+    pub fn can_next(&self) -> bool {
+        self.queue_len() > 0
+            || self.radio.is_some()
+            || (self.auto_radio
+                && self.current.is_some()
+                && matches!(
+                    self.playback,
+                    Playback::Loading | Playback::Playing | Playback::Paused
+                ))
     }
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+}
+impl MusicApp {
+    pub(crate) fn draw_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         // Start only when Home is shown; opt-in captures keep their deterministic fixtures.
         #[cfg(feature = "ui-qa")]
@@ -1745,6 +1959,7 @@ impl eframe::App for MusicApp {
         // Workers wake the UI when something changes. An idle or paused player
         // has no periodic redraw; controls still repaint immediately on input.
         if self.searching
+            || self.account.loading
             || self.recommendations.searching
             || self.radio.as_ref().is_some_and(|r| r.searching)
         {
@@ -1758,6 +1973,19 @@ impl eframe::App for MusicApp {
         crate::qa::capture(self, &ctx);
         #[cfg(feature = "ui-qa")]
         crate::qa::finish_first_ui(&ctx);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+impl eframe::App for MusicApp {
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe also calls logic for covered/minimized windows. Drain events
+        // and advance the queue there, without rendering or retaining a backlog.
+        self.receive();
+        #[cfg(feature = "ui-qa")]
+        crate::qa::report_startup(_frame.info().cpu_usage.is_some());
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw_ui(ui);
     }
 }
 impl Drop for MusicApp {
@@ -1794,6 +2022,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = MusicApp::from_library(&ctx, Vec::new(), Session::default(), None);
         app.write_library = false;
+        app.account.worker = account::Worker::fixture().0;
         app.favorites.clear();
         app.recent.clear();
         app.saved_tracks.clear();
@@ -1811,9 +2040,137 @@ mod tests {
         let (recommendation_tx, recommendation_jobs) = mpsc::channel::<SearchJob>();
         thread::spawn(move || while recommendation_jobs.recv().is_ok() {});
         app.recommendation_tx = recommendation_tx;
+        let (radio_tx, radio_jobs) = mpsc::channel::<SearchJob>();
+        thread::spawn(move || while radio_jobs.recv().is_ok() {});
+        app.radio_tx = radio_tx;
         app.player_tx = tx;
         app.player_rx = rx;
         (app, commands, events, ctx)
+    }
+    #[test]
+    fn account_import_is_isolated_and_disconnect_clears_remote_data_and_stale_results() {
+        let (mut app, commands, _, ctx) = fixture();
+        let (worker, results) = account::Worker::fixture();
+        app.account.worker = worker;
+        let remote = track("dQw4w9WgXcQ");
+        let local = track("hTWKbfoikeg");
+        app.favorites.push(local.clone());
+        app.request_account(AccountRequest::Refresh);
+        let token = app.account.worker.token;
+        results
+            .send(account::Message {
+                token: token.wrapping_sub(1),
+                result: Ok(AccountResponse::Library(Some(account::Library::default()))),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.account.library.is_none());
+        assert!(app.account.loading);
+        results
+            .send(account::Message {
+                token,
+                result: Ok(AccountResponse::Library(Some(account::Library {
+                    likes: vec![remote.clone(), local.clone()],
+                    ..Default::default()
+                }))),
+            })
+            .unwrap();
+        app.receive();
+        assert!(!app.account.loading);
+        assert_eq!(app.library, [local.clone(), remote.clone()]);
+        assert_eq!(app.favorites, std::slice::from_ref(&local));
+        assert_eq!(app.recommendation_seed(), Some(remote.clone()));
+        app.view = View::Account;
+        assert_eq!(app.active_tracks(), [remote.clone(), local.clone()]);
+        app.dispatch(Action::AccountTab(account::Tab::Subscriptions), &ctx);
+        assert!(app.active_tracks().is_empty());
+        app.dispatch(Action::DisconnectAccount, &ctx);
+        assert!(app.account.library.is_none());
+        assert!(app.account.playlist.is_none());
+        assert_eq!(app.library, std::slice::from_ref(&local));
+        assert_eq!(app.recommendation_seed(), Some(local));
+        results
+            .send(account::Message {
+                token,
+                result: Ok(AccountResponse::Library(Some(account::Library::default()))),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.account.library.is_none());
+        assert!(
+            commands
+                .try_iter()
+                .all(|c| !matches!(c, PlayerCommand::Play { .. }))
+        );
+    }
+    #[test]
+    fn account_playlist_results_keep_repeats_and_cannot_replace_another_playlist() {
+        let (mut app, _, _, ctx) = fixture();
+        let (worker, results) = account::Worker::fixture();
+        app.account.worker = worker;
+        let collection = Collection {
+            id: "private-one".into(),
+            title: "Private playlist".into(),
+            subtitle: String::new(),
+            kind: CollectionKind::Playlist,
+            thumbnail: None,
+            params: None,
+        };
+        app.dispatch(Action::AccountPlaylist(collection), &ctx);
+        let token = app.account.worker.token;
+        let first = track("dQw4w9WgXcQ");
+        results
+            .send(account::Message {
+                token,
+                result: Ok(AccountResponse::Playlist {
+                    id: "different".into(),
+                    append: false,
+                    page: Page::from(vec![first.clone()]),
+                }),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.account.playlist.as_ref().unwrap().1.tracks.is_empty());
+        results
+            .send(account::Message {
+                token,
+                result: Ok(AccountResponse::Playlist {
+                    id: "private-one".into(),
+                    append: false,
+                    page: Page {
+                        tracks: vec![first.clone()],
+                        continuation: Some("next".into()),
+                        ..Default::default()
+                    },
+                }),
+            })
+            .unwrap();
+        app.receive();
+        app.dispatch(Action::AccountMore, &ctx);
+        results
+            .send(account::Message {
+                token: app.account.worker.token,
+                result: Ok(AccountResponse::Playlist {
+                    id: "private-one".into(),
+                    append: true,
+                    page: Page::from(vec![first.clone()]),
+                }),
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(
+            app.account.playlist.as_ref().unwrap().1.tracks,
+            [first.clone(), first]
+        );
+        assert!(
+            app.account
+                .playlist
+                .as_ref()
+                .unwrap()
+                .1
+                .continuation
+                .is_none()
+        );
     }
     #[test]
     fn saved_session_restores_current_track_and_position_without_autoplay() {
@@ -1906,9 +2263,10 @@ mod tests {
         assert_eq!(recommendations.tracks, new[..12]);
         assert!(!recommendations.searching);
         recommendations.complete(Err("offline".into()), &[]);
-        assert!(recommendations.tracks.is_empty());
+        assert_eq!(recommendations.tracks, new[..12]);
         assert_eq!(recommendations.error.as_deref(), Some("offline"));
         recommendations.complete(Ok(vec![]), &[]);
+        assert!(recommendations.tracks.is_empty());
         assert!(recommendations.error.is_none());
     }
     #[test]
@@ -1968,6 +2326,86 @@ mod tests {
         assert!(app.recommendations.seed.is_none() && app.recommendations.tracks.is_empty());
     }
     #[test]
+    fn refreshing_recommendations_keeps_cards_coalesces_clicks_and_survives_failure() {
+        let (mut app, commands, _, ctx) = fixture();
+        let (tx, jobs) = mpsc::channel();
+        let (results, rx) = mpsc::channel();
+        app.recommendation_tx = tx;
+        app.recommendation_rx = rx;
+        app.favorites.push(track("dQw4w9WgXcQ"));
+        app.dispatch(Action::Navigate(View::Home), &ctx);
+        let initial = jobs.recv().unwrap();
+        let previous = vec![track("4NRXx6U8ABQ"), track("hTWKbfoikeg")];
+        results
+            .send(SearchResult {
+                token: initial.token,
+                result: Ok(previous.clone()),
+            })
+            .unwrap();
+        app.receive();
+        app.selected = Some(1);
+        app.dispatch(Action::RefreshRecommendations, &ctx);
+        let refresh = jobs.recv().unwrap();
+        for _ in 0..5 {
+            app.dispatch(Action::RefreshRecommendations, &ctx);
+        }
+        assert!(jobs.try_recv().is_err());
+        assert_eq!(app.recommendation_token, refresh.token);
+        assert_eq!(app.recommendations.tracks, previous);
+        assert_eq!(app.active_tracks(), previous);
+        assert_eq!(app.selected, Some(1));
+        assert!(app.recommendations.searching);
+
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280., 800.),
+                )),
+                ..Default::default()
+            },
+            |ui| crate::ui::show(&mut app, ui),
+        );
+        output.textures_delta.clear();
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Refreshing…") && node.is_disabled())
+        );
+        assert!(nodes.iter().any(
+            |(_, node)| node.label() == Some("Play 4NRXx6U8ABQ · Artist") && !node.is_disabled()
+        ));
+        assert!(!format!("{:?}", output.shapes).contains("Finding songs for you"));
+
+        results
+            .send(SearchResult {
+                token: refresh.token,
+                result: Err("offline".into()),
+            })
+            .unwrap();
+        app.receive();
+        assert!(!app.recommendations.searching);
+        assert_eq!(app.recommendations.tracks, previous);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.recommendations.error.as_deref(), Some("offline"));
+        app.dispatch(Action::RefreshRecommendations, &ctx);
+        let retry = jobs.recv().unwrap();
+        let next = vec![track("JGwWNGJdvx8")];
+        results
+            .send(SearchResult {
+                token: retry.token,
+                result: Ok(next.clone()),
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(app.recommendations.tracks, next);
+        assert!(app.selected.is_none());
+        assert!(app.recommendations.error.is_none());
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
     fn discovery_shortcuts_submit_search_without_playing_or_editing_queue() {
         let (mut app, commands, _, ctx) = fixture();
         let (tx, jobs) = mpsc::channel();
@@ -2018,6 +2456,138 @@ mod tests {
         app.recent = (0..40).map(|i| track(&format!("{i:011}"))).collect();
         assert_eq!(app.active_tracks().len(), 12);
     }
+    #[test]
+    fn exhausted_queue_starts_radio_from_the_last_track_and_skips_played_songs() {
+        let (mut app, commands, events, ctx) = fixture();
+        let (tx, jobs) = mpsc::channel();
+        let (results, rx) = mpsc::channel();
+        app.radio_tx = tx;
+        app.radio_rx = rx;
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        let c = track("JGwWNGJdvx8");
+        app.dispatch(Action::PlayTracks(vec![a.clone(), b.clone()]), &ctx);
+        assert!(jobs.try_recv().is_err());
+        for _ in 0..2 {
+            events
+                .send(PlayerEvent {
+                    generation: app.generation,
+                    event: PlaybackEvent::Ended,
+                })
+                .unwrap();
+            app.receive();
+        }
+        let job = jobs.try_recv().unwrap();
+        assert_eq!(job.query, b.id);
+        assert!(jobs.try_recv().is_err());
+        let radio = app.radio.as_ref().unwrap();
+        assert_eq!(radio.seed, b);
+        assert!(radio.searching && radio.waiting);
+        assert!(!app.queue_open);
+        commands.try_iter().for_each(drop);
+        results
+            .send(SearchResult {
+                token: job.token,
+                result: Ok(vec![a, b, c.clone(), c.clone()]),
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(app.current, Some(c.clone()));
+        assert!(!app.radio.as_ref().unwrap().waiting);
+        assert!(
+            matches!(commands.try_recv().unwrap(), PlayerCommand::Play { track, .. } if track == c)
+        );
+        assert_eq!(jobs.try_recv().unwrap().query, c.id);
+    }
+
+    #[test]
+    fn automatic_radio_respects_stop_and_restarts_after_a_new_selection() {
+        for stop in [Action::Stop, Action::StopRadio] {
+            let (mut app, commands, events, ctx) = fixture();
+            let (tx, jobs) = mpsc::channel();
+            let (results, rx) = mpsc::channel();
+            app.radio_tx = tx;
+            app.radio_rx = rx;
+            let a = track("dQw4w9WgXcQ");
+            let b = track("hTWKbfoikeg");
+            app.dispatch(Action::Play(a), &ctx);
+            assert!(app.can_next());
+            app.dispatch(Action::Next, &ctx);
+            let job = jobs.try_recv().unwrap();
+            app.dispatch(stop, &ctx);
+            commands.try_iter().for_each(drop);
+            results
+                .send(SearchResult {
+                    token: job.token,
+                    result: Ok(vec![b.clone()]),
+                })
+                .unwrap();
+            app.receive();
+            assert!(app.radio.is_none());
+            assert!(!app.can_next());
+            assert!(commands.try_recv().is_err());
+            app.dispatch(Action::Next, &ctx);
+            assert!(jobs.try_recv().is_err());
+            app.dispatch(Action::Play(b.clone()), &ctx);
+            events
+                .send(PlayerEvent {
+                    generation: app.generation,
+                    event: PlaybackEvent::Ended,
+                })
+                .unwrap();
+            app.receive();
+            assert_eq!(jobs.try_recv().unwrap().query, b.id);
+        }
+    }
+
+    #[test]
+    fn automatic_radio_failures_wait_for_retry_and_manual_tracks_keep_priority() {
+        let (mut app, commands, _, ctx) = fixture();
+        let (tx, jobs) = mpsc::channel();
+        let (results, rx) = mpsc::channel();
+        app.radio_tx = tx;
+        app.radio_rx = rx;
+        app.dispatch(Action::Next, &ctx);
+        assert!(jobs.try_recv().is_err());
+        let a = track("dQw4w9WgXcQ");
+        let manual = track("hTWKbfoikeg");
+        let related = track("JGwWNGJdvx8");
+        app.dispatch(Action::Play(a.clone()), &ctx);
+        app.dispatch(Action::Next, &ctx);
+        let job = jobs.try_recv().unwrap();
+        results
+            .send(SearchResult {
+                token: job.token,
+                result: Err("offline".into()),
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(
+            app.radio.as_ref().unwrap().error.as_deref(),
+            Some("offline")
+        );
+        app.dispatch(Action::Next, &ctx);
+        assert!(jobs.try_recv().is_err());
+        app.dispatch(Action::RetryRadio, &ctx);
+        let retry = jobs.try_recv().unwrap();
+        assert_eq!(retry.query, a.id);
+        app.dispatch(Action::Enqueue(manual.clone(), true), &ctx);
+        commands.try_iter().for_each(drop);
+        results
+            .send(SearchResult {
+                token: retry.token,
+                result: Ok(vec![a, manual.clone(), related.clone()]),
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(app.current, Some(manual));
+        assert_eq!(
+            app.radio.as_ref().unwrap().upcoming,
+            VecDeque::from([related.clone()])
+        );
+        assert!(commands.try_iter().any(|command| matches!(command, PlayerCommand::PrepareNext { track: Some(track), .. } if track == related)));
+    }
+
     #[test]
     fn radio_preserves_manual_queue_filters_duplicates_and_continues() {
         let (mut app, commands, events, ctx) = fixture();
@@ -2077,8 +2647,7 @@ mod tests {
                     event: PlaybackEvent::Ended,
                 })
                 .unwrap();
-            let mut frame = eframe::Frame::_new_kittest();
-            eframe::App::logic(&mut app, &ctx, &mut frame);
+            app.receive();
             assert_eq!(app.current, Some(expected));
             assert!(matches!(
                 commands.recv().unwrap(),
@@ -2280,9 +2849,8 @@ mod tests {
                 })
                 .unwrap();
         }
-        let mut frame = eframe::Frame::_new_kittest();
-        // Match eframe's hidden-window path: logic runs, no UI is constructed.
-        eframe::App::logic(&mut app, &ctx, &mut frame);
+        // The hidden-window path drains events without constructing the UI.
+        app.receive();
         assert_eq!(app.current, Some(b));
         assert!(app.queue.is_empty());
         assert!(app.player_rx.try_recv().is_err());
@@ -2291,6 +2859,153 @@ mod tests {
             PlayerCommand::Play { .. }
         ));
     }
+    #[test]
+    fn collection_song_selection_queues_the_remaining_tracks_and_advances_after_navigation() {
+        for playlist in [false, true] {
+            for input in ["cover", "row", "keyboard"] {
+                let (mut app, commands, events, ctx) = fixture();
+                ctx.enable_accesskit();
+                let mut tracks: Vec<_> =
+                    ["dQw4w9WgXcQ", "hTWKbfoikeg", "4NRXx6U8ABQ", "JGwWNGJdvx8"]
+                        .into_iter()
+                        .map(track)
+                        .collect();
+                for (track, title) in
+                    tracks
+                        .iter_mut()
+                        .zip(["Speak to Me", "Breathe", "On the Run", "Time"])
+                {
+                    track.title = title.into();
+                }
+                app.view = View::Collection;
+                if playlist {
+                    app.playlists.push(Playlist {
+                        id: 7,
+                        title: "Album playlist".into(),
+                        tracks: tracks.clone(),
+                    });
+                    app.playlist_id = Some(7);
+                } else {
+                    app.collection = Some(Collection {
+                        id: "MPREalbum".into(),
+                        title: "Album".into(),
+                        subtitle: "Artist".into(),
+                        kind: CollectionKind::Album,
+                        thumbnail: None,
+                        params: None,
+                    });
+                    app.detail.tracks = tracks.clone();
+                }
+                app.queue.push_back(track("Eq8ZiZ9xiLw"));
+                app.queue_selected = Some(0);
+                app.radio = Some(Radio::new(track("Eq8ZiZ9xiLw")));
+                app.selected = Some(1);
+                app.filter = "Breathe".into();
+                let render = |app: &mut MusicApp, events| {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1280., 900.),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            app.shortcuts(ui.ctx());
+                            crate::ui::show(app, ui);
+                        },
+                    );
+                    output.textures_delta.clear();
+                    output
+                };
+                let output = render(&mut app, vec![]);
+                let event = if input == "keyboard" {
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }
+                } else {
+                    let label = if input == "cover" {
+                        "Play Breathe"
+                    } else {
+                        "Breathe · Artist"
+                    };
+                    let id = output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .unwrap()
+                        .0;
+                    egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::Click,
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        target_node: id,
+                        data: None,
+                    })
+                };
+                render(&mut app, vec![event]);
+                assert_eq!(
+                    app.current.as_ref(),
+                    Some(&tracks[1]),
+                    "{input}, playlist={playlist}"
+                );
+                assert_eq!(app.queue.iter().cloned().collect::<Vec<_>>(), tracks[2..]);
+                assert!(app.radio.is_none());
+                assert!(app.queue_selected.is_none());
+                let sent: Vec<_> = commands.try_iter().collect();
+                assert!(sent.iter().any(|command| matches!(command, PlayerCommand::Play { track, .. } if track == &tracks[1])));
+                assert!(sent.iter().any(|command| matches!(command, PlayerCommand::PrepareNext { track: Some(next), following, .. } if next == &tracks[2] && following == &tracks[3..])));
+                app.dispatch(Action::Navigate(View::Search), &ctx);
+                for next in &tracks[2..] {
+                    events
+                        .send(PlayerEvent {
+                            generation: app.generation,
+                            event: PlaybackEvent::Ended,
+                        })
+                        .unwrap();
+                    app.receive();
+                    assert_eq!(app.current.as_ref(), Some(next));
+                }
+                events
+                    .send(PlayerEvent {
+                        generation: app.generation,
+                        event: PlaybackEvent::Ended,
+                    })
+                    .unwrap();
+                app.receive();
+                assert!(app.queue.is_empty());
+                assert_eq!(app.playback, Playback::Stopped);
+                assert_eq!(app.radio.as_ref().unwrap().seed, tracks[3]);
+                assert!(app.radio.as_ref().unwrap().waiting);
+            }
+        }
+    }
+
+    #[test]
+    fn collection_playback_starts_at_the_selected_occurrence_and_ignores_invalid_indices() {
+        let (mut app, commands, _, ctx) = fixture();
+        let a = track("dQw4w9WgXcQ");
+        let b = track("hTWKbfoikeg");
+        let c = track("4NRXx6U8ABQ");
+        app.view = View::Collection;
+        app.detail.tracks = vec![a.clone(), b, a.clone(), c.clone()];
+        app.dispatch(Action::PlayCollectionTrack(2), &ctx);
+        assert_eq!(app.current, Some(a));
+        assert_eq!(app.queue, VecDeque::from([c]));
+        commands.try_iter().for_each(drop);
+        app.dispatch(Action::PlayCollectionTrack(4), &ctx);
+        assert!(commands.try_recv().is_err());
+        assert_eq!(app.queue.len(), 1);
+    }
+
     #[test]
     fn preparation_window_is_bounded_and_tail_edits_preserve_the_handoff_ticket() {
         let (mut app, commands, _, ctx) = fixture();
@@ -2937,6 +3652,96 @@ mod tests {
     }
 
     #[test]
+    fn seek_bar_edits_resume_position_before_playback_and_during_playback() {
+        for playback in [
+            Playback::Stopped,
+            Playback::Error,
+            Playback::Loading,
+            Playback::Playing,
+            Playback::Paused,
+        ] {
+            let (mut app, commands, _, ctx) = fixture();
+            ctx.enable_accesskit();
+            app.current = Some(track("dQw4w9WgXcQ"));
+            app.playback = playback;
+            app.position = 65.;
+            // A restored session only has the catalog duration, no mpv metadata.
+            assert!(app.duration.is_none());
+            assert!(!app.seekable);
+            let render = |app: &mut MusicApp, events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280., 800.),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| crate::ui::show(app, ui),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            let output = render(&mut app, vec![]);
+            let (id, node) = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Seek"))
+                .unwrap();
+            assert!(!node.is_disabled(), "seek disabled for {playback:?}");
+            commands.try_iter().for_each(drop);
+            render(
+                &mut app,
+                vec![egui::Event::AccessKitActionRequest(
+                    egui::accesskit::ActionRequest {
+                        action: egui::accesskit::Action::SetValue,
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        target_node: *id,
+                        data: Some(egui::accesskit::ActionData::NumericValue(73.)),
+                    },
+                )],
+            );
+            assert_eq!(app.position, 73., "seek ignored for {playback:?}");
+            assert_eq!(app.playback, playback);
+            if matches!(playback, Playback::Stopped | Playback::Error) {
+                assert!(commands.try_recv().is_err());
+                app.dispatch(Action::TogglePlayback, &ctx);
+                assert!(matches!(
+                    commands.recv().unwrap(),
+                    PlayerCommand::Play { position: 73., .. }
+                ));
+            } else {
+                assert!(matches!(commands.recv().unwrap(), PlayerCommand::Seek(73.)));
+            }
+        }
+    }
+
+    #[test]
+    fn seek_commands_use_the_clamped_position_and_ignore_non_finite_values() {
+        let (mut app, commands, _, ctx) = fixture();
+        app.current = Some(track("dQw4w9WgXcQ"));
+        app.playback = Playback::Playing;
+        for (requested, expected) in [(-10., 0.), (250., 180.)] {
+            app.dispatch(Action::Seek(requested), &ctx);
+            assert_eq!(app.position, expected);
+            assert!(matches!(
+                commands.recv().unwrap(),
+                PlayerCommand::Seek(position) if position == expected
+            ));
+        }
+        for requested in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            app.dispatch(Action::Seek(requested), &ctx);
+            assert_eq!(app.position, 180.);
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn mute_restores_volume_and_seek_needs_a_current_track() {
         let (mut app, commands, _, ctx) = fixture();
         app.volume = 42;
@@ -2954,6 +3759,7 @@ mod tests {
         app.dispatch(Action::Seek(15.), &ctx);
         assert!(commands.try_recv().is_err());
         app.current = Some(track("dQw4w9WgXcQ"));
+        app.playback = Playback::Paused;
         app.dispatch(Action::Seek(15.), &ctx);
         assert!(matches!(commands.recv().unwrap(), PlayerCommand::Seek(15.)));
     }
